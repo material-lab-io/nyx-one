@@ -61,8 +61,8 @@ function validateRequiredEnv(env: MoltbotEnv): string[] {
     missing.push('MOLTBOT_GATEWAY_TOKEN');
   }
 
-  // CF Access vars not required in dev/test mode since auth is skipped
-  if (!isTestMode) {
+  // CF Access vars not required in dev/test mode or when gateway token auth is used
+  if (!isTestMode && !env.MOLTBOT_GATEWAY_TOKEN) {
     if (!env.CF_ACCESS_TEAM_DOMAIN) {
       missing.push('CF_ACCESS_TEAM_DOMAIN');
     }
@@ -72,15 +72,14 @@ function validateRequiredEnv(env: MoltbotEnv): string[] {
     }
   }
 
-  // Check for AI Gateway or direct Anthropic configuration
+  // Check for at least one LLM provider configuration
   if (env.AI_GATEWAY_API_KEY) {
     // AI Gateway requires both API key and base URL
     if (!env.AI_GATEWAY_BASE_URL) {
       missing.push('AI_GATEWAY_BASE_URL (required when using AI_GATEWAY_API_KEY)');
     }
-  } else if (!env.ANTHROPIC_API_KEY) {
-    // Direct Anthropic access requires API key
-    missing.push('ANTHROPIC_API_KEY or AI_GATEWAY_API_KEY');
+  } else if (!env.ANTHROPIC_API_KEY && !env.GROQ_API_KEY) {
+    missing.push('ANTHROPIC_API_KEY, GROQ_API_KEY, or AI_GATEWAY_API_KEY');
   }
 
   return missing;
@@ -189,6 +188,11 @@ app.use('*', async (c, next) => {
 
 // Middleware: Cloudflare Access authentication for protected routes
 app.use('*', async (c, next) => {
+  // Skip CF Access auth if not configured (using gateway token auth instead)
+  if (!c.env.CF_ACCESS_TEAM_DOMAIN || !c.env.CF_ACCESS_AUD) {
+    return next();
+  }
+
   // Determine response type based on Accept header
   const acceptsHtml = c.req.header('Accept')?.includes('text/html');
   const middleware = createAccessMiddleware({
@@ -230,7 +234,10 @@ app.all('*', async (c) => {
   const isGatewayReady = existingProcess !== null && existingProcess.status === 'running';
 
   // For browser requests (non-WebSocket, non-API), show loading page if gateway isn't ready
-  const isWebSocketRequest = request.headers.get('Upgrade')?.toLowerCase() === 'websocket';
+  // Note: Cloudflare's edge strips the Upgrade header (HTTP/2 doesn't use it).
+  // Detect WebSocket by Sec-WebSocket-Key which IS preserved through the edge.
+  const isWebSocketRequest = request.headers.get('Upgrade')?.toLowerCase() === 'websocket'
+    || !!request.headers.get('Sec-WebSocket-Key');
   const acceptsHtml = request.headers.get('Accept')?.includes('text/html');
 
   if (!isGatewayReady && !isWebSocketRequest && acceptsHtml) {
@@ -255,8 +262,8 @@ app.all('*', async (c) => {
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';
 
     let hint = 'Check worker logs with: wrangler tail';
-    if (!c.env.ANTHROPIC_API_KEY) {
-      hint = 'ANTHROPIC_API_KEY is not set. Run: wrangler secret put ANTHROPIC_API_KEY';
+    if (!c.env.ANTHROPIC_API_KEY && !c.env.GROQ_API_KEY) {
+      hint = 'No LLM provider configured. Run: wrangler secret put GROQ_API_KEY (or ANTHROPIC_API_KEY)';
     } else if (errorMessage.includes('heap out of memory') || errorMessage.includes('OOM')) {
       hint = 'Gateway ran out of memory. Try again or check for memory leaks.';
     }
@@ -270,6 +277,17 @@ app.all('*', async (c) => {
 
   // Proxy to Moltbot with WebSocket message interception
   if (isWebSocketRequest) {
+    // Validate Origin header to prevent cross-site WebSocket hijacking (CSWSH)
+    const origin = request.headers.get('Origin');
+    const host = request.headers.get('Host');
+    if (origin) {
+      const originHost = new URL(origin).host;
+      if (originHost !== host) {
+        console.warn('[WS] Rejected cross-origin WebSocket:', origin, '!=', host);
+        return new Response('Forbidden: origin mismatch', { status: 403 });
+      }
+    }
+
     const debugLogs = c.env.DEBUG_ROUTES === 'true';
     const redactedSearch = redactSensitiveParams(url);
 
@@ -279,7 +297,18 @@ app.all('*', async (c) => {
     }
 
     // Get WebSocket connection to the container
-    const containerResponse = await sandbox.wsConnect(request, MOLTBOT_PORT);
+    // Add X-Forwarded-Proto so the gateway knows the original request was HTTPS
+    // Re-add Upgrade/Connection headers that Cloudflare's edge strips (HTTP/2)
+    const wsHeaders = new Headers(request.headers);
+    wsHeaders.set('X-Forwarded-Proto', url.protocol.replace(':', ''));
+    wsHeaders.set('X-Forwarded-Host', url.host);
+    wsHeaders.set('Upgrade', 'websocket');
+    wsHeaders.set('Connection', 'Upgrade');
+    const wsRequest = new Request(request.url, {
+      method: request.method,
+      headers: wsHeaders,
+    });
+    const containerResponse = await sandbox.wsConnect(wsRequest, MOLTBOT_PORT);
     console.log('[WS] wsConnect response status:', containerResponse.status);
 
     // Get the container-side WebSocket
@@ -311,8 +340,24 @@ app.all('*', async (c) => {
       if (debugLogs) {
         console.log('[WS] Client -> Container:', typeof event.data, typeof event.data === 'string' ? event.data.slice(0, 200) : '(binary)');
       }
+      let data = event.data;
+      // Inject gateway token into WebSocket connect method
+      if (typeof data === 'string' && c.env.MOLTBOT_GATEWAY_TOKEN) {
+        try {
+          const parsed = JSON.parse(data);
+          if (parsed.type === 'req' && parsed.method === 'connect') {
+            parsed.params = parsed.params || {};
+            parsed.params.auth = parsed.params.auth || {};
+            parsed.params.auth.token = c.env.MOLTBOT_GATEWAY_TOKEN;
+            data = JSON.stringify(parsed);
+            if (debugLogs) {
+              console.log('[WS] Injected gateway token into connect message');
+            }
+          }
+        } catch {}
+      }
       if (containerWs.readyState === WebSocket.OPEN) {
-        containerWs.send(event.data);
+        containerWs.send(data);
       } else if (debugLogs) {
         console.log('[WS] Container not open, readyState:', containerWs.readyState);
       }
@@ -357,11 +402,14 @@ app.all('*', async (c) => {
     });
 
     // Handle close events
+    // Note: codes 1005 and 1006 are reserved by the WebSocket spec and cannot
+    // be sent in a close frame. Replace with 1001 (Going Away) to avoid crashes.
     serverWs.addEventListener('close', (event) => {
       if (debugLogs) {
         console.log('[WS] Client closed:', event.code, event.reason);
       }
-      containerWs.close(event.code, event.reason);
+      const safeCode = (event.code === 1005 || event.code === 1006) ? 1001 : event.code;
+      containerWs.close(safeCode, event.reason);
     });
 
     containerWs.addEventListener('close', (event) => {
@@ -376,7 +424,8 @@ app.all('*', async (c) => {
       if (debugLogs) {
         console.log('[WS] Transformed close reason:', reason);
       }
-      serverWs.close(event.code, reason);
+      const safeCode = (event.code === 1005 || event.code === 1006) ? 1001 : event.code;
+      serverWs.close(safeCode, reason);
     });
 
     // Handle errors
@@ -400,7 +449,16 @@ app.all('*', async (c) => {
   }
 
   console.log('[HTTP] Proxying:', url.pathname + url.search);
-  const httpResponse = await sandbox.containerFetch(request, MOLTBOT_PORT);
+  // Add X-Forwarded-Proto so the gateway knows the original request was HTTPS
+  const httpHeaders = new Headers(request.headers);
+  httpHeaders.set('X-Forwarded-Proto', url.protocol.replace(':', ''));
+  httpHeaders.set('X-Forwarded-Host', url.host);
+  const httpRequest = new Request(request.url, {
+    method: request.method,
+    headers: httpHeaders,
+    body: request.body,
+  });
+  const httpResponse = await sandbox.containerFetch(httpRequest, MOLTBOT_PORT);
   console.log('[HTTP] Response status:', httpResponse.status);
 
   // Add debug header to verify worker handled the request

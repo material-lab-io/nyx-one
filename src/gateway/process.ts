@@ -5,6 +5,39 @@ import { buildEnvVars } from './env';
 import { mountR2Storage } from './r2';
 
 /**
+ * Kill all clawdbot/gateway processes in the container.
+ * This is more aggressive than just killing the parent start-moltbot.sh process
+ * because child node processes can become orphaned and hold the port.
+ */
+export async function killAllGatewayProcesses(sandbox: Sandbox): Promise<void> {
+  console.log('[Gateway] Killing all clawdbot processes...');
+
+  // Kill via pkill (catches all clawdbot processes including orphaned children)
+  try {
+    const killProc = await sandbox.startProcess('pkill -9 -f clawdbot || true');
+    await new Promise(r => setTimeout(r, 1000));
+    const logs = await killProc.getLogs();
+    console.log('[Gateway] pkill result:', logs.stdout, logs.stderr);
+  } catch (e) {
+    console.log('[Gateway] pkill failed (may be expected):', e);
+  }
+
+  // Also clean up lock files that can prevent startup
+  try {
+    const cleanupProc = await sandbox.startProcess(
+      'rm -f /tmp/clawdbot-gateway.lock /root/.clawdbot/gateway.lock 2>/dev/null || true'
+    );
+    await new Promise(r => setTimeout(r, 500));
+  } catch (e) {
+    // Ignore cleanup errors
+  }
+
+  // Wait a moment for ports to be released
+  await new Promise(r => setTimeout(r, 1500));
+  console.log('[Gateway] Cleanup complete');
+}
+
+/**
  * Find an existing Moltbot gateway process
  * 
  * @param sandbox - The sandbox instance

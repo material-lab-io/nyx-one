@@ -1,7 +1,7 @@
 import { Hono } from 'hono';
 import type { AppEnv } from '../types';
 import { createAccessMiddleware } from '../auth';
-import { ensureMoltbotGateway, findExistingMoltbotProcess, mountR2Storage, syncToR2, waitForProcess } from '../gateway';
+import { ensureMoltbotGateway, findExistingMoltbotProcess, killAllGatewayProcesses, mountR2Storage, syncToR2, waitForProcess } from '../gateway';
 import { R2_MOUNT_PATH } from '../config';
 
 // CLI commands can take 10-15 seconds to complete due to WebSocket connection overhead
@@ -245,19 +245,12 @@ adminApi.post('/gateway/restart', async (c) => {
   const sandbox = c.get('sandbox');
 
   try {
-    // Find and kill the existing gateway process
+    // Find existing process for reporting
     const existingProcess = await findExistingMoltbotProcess(sandbox);
-    
-    if (existingProcess) {
-      console.log('Killing existing gateway process:', existingProcess.id);
-      try {
-        await existingProcess.kill();
-      } catch (killErr) {
-        console.error('Error killing process:', killErr);
-      }
-      // Wait a moment for the process to die
-      await new Promise(r => setTimeout(r, 2000));
-    }
+
+    // Kill ALL gateway processes (including orphaned child processes)
+    // This is more aggressive than just killing the parent process
+    await killAllGatewayProcesses(sandbox);
 
     // Start a new gateway in the background
     const bootPromise = ensureMoltbotGateway(sandbox, c.env).catch((err) => {
@@ -267,7 +260,7 @@ adminApi.post('/gateway/restart', async (c) => {
 
     return c.json({
       success: true,
-      message: existingProcess 
+      message: existingProcess
         ? 'Gateway process killed, new instance starting...'
         : 'No existing process found, starting new instance...',
       previousProcessId: existingProcess?.id,

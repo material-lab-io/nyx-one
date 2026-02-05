@@ -168,7 +168,7 @@ if (config.models?.providers?.anthropic?.models) {
 // Gateway configuration
 config.gateway.port = 18789;
 config.gateway.mode = 'local';
-config.gateway.trustedProxies = ['10.1.0.0'];
+config.gateway.trustedProxies = ['0.0.0.0/0'];
 
 // Set gateway token if provided
 if (process.env.CLAWDBOT_GATEWAY_TOKEN) {
@@ -176,11 +176,11 @@ if (process.env.CLAWDBOT_GATEWAY_TOKEN) {
     config.gateway.auth.token = process.env.CLAWDBOT_GATEWAY_TOKEN;
 }
 
-// Allow insecure auth for dev mode
-if (process.env.CLAWDBOT_DEV_MODE === 'true') {
-    config.gateway.controlUi = config.gateway.controlUi || {};
-    config.gateway.controlUi.allowInsecureAuth = true;
-}
+// Allow insecure auth on the gateway's internal listener.
+// The Worker proxy handles the secure HTTPS context for external clients,
+// so the internal HTTP link between Worker and container is safe.
+config.gateway.controlUi = config.gateway.controlUi || {};
+config.gateway.controlUi.allowInsecureAuth = true;
 
 // Telegram configuration
 if (process.env.TELEGRAM_BOT_TOKEN) {
@@ -205,13 +205,18 @@ if (process.env.DISCORD_BOT_TOKEN) {
     config.channels.discord = config.channels.discord || {};
     config.channels.discord.token = process.env.DISCORD_BOT_TOKEN;
     config.channels.discord.enabled = true;
-    const discordDmPolicy = process.env.DISCORD_DM_POLICY || 'pairing';
+
+    // DM policy - allow DMs from anyone
+    const discordDmPolicy = process.env.DISCORD_DM_POLICY || 'open';
     config.channels.discord.dm = config.channels.discord.dm || {};
     config.channels.discord.dm.policy = discordDmPolicy;
-    // "open" policy requires allowFrom: ["*"]
     if (discordDmPolicy === 'open') {
         config.channels.discord.dm.allowFrom = ['*'];
     }
+
+    // Guild/server policy - 'open' allows bot to respond in any server channel
+    // Must be set explicitly or doctor will default to 'allowlist'
+    config.channels.discord.groupPolicy = process.env.DISCORD_GROUP_POLICY || 'open';
 }
 
 // Slack configuration
@@ -279,11 +284,75 @@ if (isOpenAI) {
     config.agents.defaults.model.primary = 'anthropic/claude-opus-4-5';
 }
 
+// Groq provider configuration
+if (process.env.GROQ_API_KEY) {
+    console.log('Configuring Groq provider...');
+    config.models = config.models || {};
+    config.models.providers = config.models.providers || {};
+    config.models.providers.groq = {
+        baseUrl: 'https://api.groq.com/openai/v1',
+        apiKey: process.env.GROQ_API_KEY,
+        api: 'openai-completions',
+        models: [
+            { id: 'meta-llama/llama-4-maverick-17b-128e-instruct', name: 'Llama 4 Maverick', reasoning: false, input: ['text', 'image'], contextWindow: 131072, maxTokens: 8192 },
+            { id: 'meta-llama/llama-4-scout-17b-16e-instruct', name: 'Llama 4 Scout', reasoning: false, input: ['text', 'image'], contextWindow: 131072, maxTokens: 8192 },
+            { id: 'llama-3.3-70b-versatile', name: 'Llama 3.3 70B Versatile', reasoning: false, input: ['text'], contextWindow: 131072, maxTokens: 32768 },
+            { id: 'deepseek-r1-distill-llama-70b', name: 'DeepSeek R1 Distill 70B', reasoning: true, input: ['text'], contextWindow: 131072, maxTokens: 16384 },
+            { id: 'qwen-qwq-32b', name: 'Qwen QWQ 32B', reasoning: true, input: ['text'], contextWindow: 131072, maxTokens: 16384 },
+        ]
+    };
+    // Add Groq models to the allowlist
+    config.agents.defaults.models = config.agents.defaults.models || {};
+    config.agents.defaults.models['groq/llama-3.3-70b-versatile'] = { alias: 'Llama 3.3 70B' };
+    config.agents.defaults.models['groq/meta-llama/llama-4-maverick-17b-128e-instruct'] = { alias: 'Llama 4 Maverick' };
+    config.agents.defaults.models['groq/meta-llama/llama-4-scout-17b-16e-instruct'] = { alias: 'Llama 4 Scout' };
+    config.agents.defaults.models['groq/deepseek-r1-distill-llama-70b'] = { alias: 'DeepSeek R1' };
+    config.agents.defaults.models['groq/qwen-qwq-32b'] = { alias: 'Qwen QWQ 32B' };
+
+    // Set Groq as primary model if no AI Gateway/Anthropic base URL is configured
+    // Use Llama 4 Maverick for better tool/function calling support
+    if (!baseUrl) {
+        config.agents.defaults.model.primary = 'groq/meta-llama/llama-4-maverick-17b-128e-instruct';
+        console.log('Groq set as primary model provider (Llama 4 Maverick)');
+    }
+}
+
 // Write updated config
 fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
 console.log('Configuration updated successfully');
-console.log('Config:', JSON.stringify(config, null, 2));
+console.log('Config summary:', JSON.stringify({
+    models: { providers: Object.keys(config.models?.providers || {}) },
+    agents: { defaults: { model: config.agents?.defaults?.model } },
+    channels: Object.fromEntries(
+        Object.entries(config.channels || {}).map(([k, v]) => [k, { enabled: v.enabled }])
+    ),
+    gateway: { ...config.gateway, auth: config.gateway?.auth ? { token: '***' } : undefined },
+}, null, 2));
 EOFNODE
+
+# Auto-fix detected issues (e.g., enable Discord channel for first time)
+echo "Running doctor --fix to apply pending changes..."
+clawdbot doctor --fix 2>&1 || true
+
+# Force groupPolicy=open after doctor (doctor defaults to 'allowlist')
+# This allows the bot to respond in any Discord server without an allowlist
+node << 'EOFFIX'
+const fs = require('fs');
+const configPath = '/root/.clawdbot/clawdbot.json';
+try {
+    const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+    if (config.channels?.discord) {
+        const oldPolicy = config.channels.discord.groupPolicy;
+        config.channels.discord.groupPolicy = 'open';
+        fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
+        if (oldPolicy !== 'open') {
+            console.log('Forced Discord groupPolicy: allowlist -> open');
+        }
+    }
+} catch (e) {
+    console.log('Note: Could not update groupPolicy:', e.message);
+}
+EOFFIX
 
 # ============================================================
 # START GATEWAY

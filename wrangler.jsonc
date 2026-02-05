@@ -7,11 +7,13 @@
   "observability": {
     "enabled": true,
   },
-  // Static assets for admin UI (built by vite)
+  // Static assets for admin UI (served programmatically via ASSETS binding in public.ts)
+  // NOTE: Global asset routing is disabled to prevent the assets layer from stripping
+  // the Upgrade: websocket header. Assets are served via explicit routes instead.
   "assets": {
     "directory": "./dist/client",
-    "not_found_handling": "single-page-application",
-    "html_handling": "auto-trailing-slash",
+    "not_found_handling": "none",
+    "html_handling": "none",
     "binding": "ASSETS",
     "run_worker_first": true,
   },
@@ -59,7 +61,7 @@
   "r2_buckets": [
     {
       "binding": "MOLTBOT_BUCKET",
-      "bucket_name": "moltbot-data",
+      "bucket_name": "nyx-one",
     },
   ],
   // Cron trigger to sync moltbot data to R2 every 5 minutes
@@ -72,7 +74,8 @@
   },
   // Note: CF_ACCOUNT_ID should be set via `wrangler secret put CF_ACCOUNT_ID`
   // Secrets to configure via `wrangler secret put`:
-  // - ANTHROPIC_API_KEY: Your Anthropic API key
+  // - GROQ_API_KEY: Your Groq API key (primary LLM provider)
+  // - ANTHROPIC_API_KEY: Your Anthropic API key (optional, secondary provider)
   // - CF_ACCESS_TEAM_DOMAIN: Cloudflare Access team domain
   // - CF_ACCESS_AUD: Cloudflare Access application audience
   // - TELEGRAM_BOT_TOKEN: (optional) Telegram bot token
