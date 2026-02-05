@@ -160,6 +160,12 @@ describe('buildEnvVars', () => {
     expect(result.OPENAI_API_KEY).toBeUndefined();
   });
 
+  it('includes GROQ_API_KEY when set', () => {
+    const env = createMockEnv({ GROQ_API_KEY: 'gsk-test-key' });
+    const result = buildEnvVars(env);
+    expect(result.GROQ_API_KEY).toBe('gsk-test-key');
+  });
+
   it('handles multiple trailing slashes in AI_GATEWAY_BASE_URL', () => {
     const env = createMockEnv({
       AI_GATEWAY_API_KEY: 'sk-gateway-key',
