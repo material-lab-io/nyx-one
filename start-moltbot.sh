@@ -217,6 +217,12 @@ if (process.env.DISCORD_BOT_TOKEN) {
     // Guild/server policy - 'open' allows bot to respond in any server channel
     // Must be set explicitly or doctor will default to 'allowlist'
     config.channels.discord.groupPolicy = process.env.DISCORD_GROUP_POLICY || 'open';
+
+    // Allow bot to respond without being mentioned in guild channels
+    // Must be set per-guild; use "*" wildcard for all guilds
+    config.channels.discord.guilds = config.channels.discord.guilds || {};
+    config.channels.discord.guilds['*'] = config.channels.discord.guilds['*'] || {};
+    config.channels.discord.guilds['*'].requireMention = false;
 }
 
 // Slack configuration

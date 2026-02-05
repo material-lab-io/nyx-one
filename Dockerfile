@@ -34,7 +34,7 @@ RUN mkdir -p /root/.clawdbot \
 
 # Copy startup script
 # Build cache bust: 2026-02-05-v27-doctor-fix
-ARG CACHE_BUST=v29
+ARG CACHE_BUST=v32
 COPY start-moltbot.sh /usr/local/bin/start-moltbot.sh
 RUN chmod +x /usr/local/bin/start-moltbot.sh
 
