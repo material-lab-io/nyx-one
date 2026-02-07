@@ -3,6 +3,8 @@ import type { AppEnv } from '../types';
 import { createAccessMiddleware } from '../auth';
 import { ensureMoltbotGateway, findExistingMoltbotProcess, killAllGatewayProcesses, mountR2Storage, syncToR2, waitForProcess } from '../gateway';
 import { R2_MOUNT_PATH } from '../config';
+import { transcribeAudio, DEFAULT_STT_MODEL } from '../stt';
+import { synthesizeSpeech, getAvailableVoices, getAvailableModels, DEFAULT_TTS_MODEL, DEFAULT_TTS_VOICE } from '../tts';
 
 // CLI commands can take 10-15 seconds to complete due to WebSocket connection overhead
 const CLI_TIMEOUT_MS = 20000;
@@ -625,6 +627,125 @@ adminApi.post('/gateway/restart', async (c) => {
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';
     return c.json({ error: errorMessage }, 500);
   }
+});
+
+// ============================================
+// STT (Speech-to-Text) Endpoints
+// ============================================
+
+// POST /api/admin/stt/transcribe - Transcribe audio to text
+// Accepts multipart/form-data with:
+//   - file: audio file (mp3, wav, webm, etc.)
+//   - language?: string (optional language hint)
+//   - model?: string (default: whisper-large-v3-turbo)
+adminApi.post('/stt/transcribe', async (c) => {
+  const groqApiKey = c.env.GROQ_API_KEY;
+  if (!groqApiKey) {
+    return c.json({ error: 'GROQ_API_KEY is not configured' }, 500);
+  }
+
+  try {
+    const formData = await c.req.formData();
+    const file = formData.get('file');
+    const language = formData.get('language') as string | null;
+    const model = formData.get('model') as string | null;
+
+    if (!file || !(file instanceof File)) {
+      return c.json({ error: 'file is required (multipart/form-data)' }, 400);
+    }
+
+    const buffer = await file.arrayBuffer();
+    const result = await transcribeAudio({
+      buffer,
+      fileName: file.name || 'audio',
+      mime: file.type || undefined,
+      apiKey: groqApiKey,
+      model: model || DEFAULT_STT_MODEL,
+      language: language || undefined,
+    });
+
+    return c.json({
+      text: result.text,
+      model: result.model,
+    });
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    return c.json({ error: errorMessage }, 500);
+  }
+});
+
+// GET /api/admin/stt/models - Get available STT models
+adminApi.get('/stt/models', async (c) => {
+  return c.json({
+    models: ['whisper-large-v3-turbo', 'whisper-large-v3', 'distil-whisper-large-v3-en'],
+    default: DEFAULT_STT_MODEL,
+    provider: 'groq',
+  });
+});
+
+// ============================================
+// TTS (Text-to-Speech) Endpoints
+// ============================================
+
+// POST /api/admin/tts/synthesize - Synthesize speech from text
+// Accepts JSON body:
+//   - text: string (required)
+//   - voice?: string (default: alloy)
+//   - model?: string (default: gpt-4o-mini-tts)
+//   - format?: mp3|opus (default: mp3)
+// Returns: audio/mpeg or audio/opus binary
+adminApi.post('/tts/synthesize', async (c) => {
+  const openaiApiKey = c.env.OPENAI_API_KEY;
+  if (!openaiApiKey) {
+    return c.json({ error: 'OPENAI_API_KEY is not configured' }, 500);
+  }
+
+  try {
+    const body = await c.req.json<{
+      text: string;
+      voice?: string;
+      model?: string;
+      format?: 'mp3' | 'opus';
+    }>();
+
+    if (!body.text?.trim()) {
+      return c.json({ error: 'text is required' }, 400);
+    }
+
+    const format = body.format || 'mp3';
+    const result = await synthesizeSpeech({
+      text: body.text,
+      apiKey: openaiApiKey,
+      model: body.model || DEFAULT_TTS_MODEL,
+      voice: body.voice || DEFAULT_TTS_VOICE,
+      responseFormat: format,
+    });
+
+    const contentType = format === 'opus' ? 'audio/opus' : 'audio/mpeg';
+    return new Response(result.audio, {
+      headers: {
+        'Content-Type': contentType,
+        'X-TTS-Model': result.model,
+        'X-TTS-Voice': result.voice,
+      },
+    });
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    return c.json({ error: errorMessage }, 500);
+  }
+});
+
+// GET /api/admin/tts/voices - Get available TTS voices and models
+adminApi.get('/tts/voices', async (c) => {
+  return c.json({
+    voices: getAvailableVoices(),
+    models: getAvailableModels(),
+    defaults: {
+      voice: DEFAULT_TTS_VOICE,
+      model: DEFAULT_TTS_MODEL,
+    },
+    provider: 'openai',
+  });
 });
 
 // Mount admin API routes under /admin
