@@ -240,6 +240,362 @@ adminApi.post('/storage/sync', async (c) => {
   }
 });
 
+// GET /api/admin/debug/env - Check what env vars the worker has access to (DEBUG)
+adminApi.get('/debug/env', async (c) => {
+  return c.json({
+    hasWhatsappEnabled: !!c.env.WHATSAPP_ENABLED,
+    whatsappEnabled: c.env.WHATSAPP_ENABLED,
+    hasWhatsappAllowFrom: !!c.env.WHATSAPP_ALLOW_FROM,
+    whatsappAllowFrom: c.env.WHATSAPP_ALLOW_FROM,
+    hasWhatsappCredsJson: !!c.env.WHATSAPP_CREDS_JSON,
+    whatsappCredsJsonLen: c.env.WHATSAPP_CREDS_JSON?.length || 0,
+    hasGroqApiKey: !!c.env.GROQ_API_KEY,
+    hasDiscordToken: !!c.env.DISCORD_BOT_TOKEN,
+    hasGatewayToken: !!c.env.MOLTBOT_GATEWAY_TOKEN,
+  });
+});
+
+// GET /api/admin/debug/processes - List all running processes
+adminApi.get('/debug/processes', async (c) => {
+  const sandbox = c.get('sandbox');
+  try {
+    const processes = await sandbox.listProcesses();
+    return c.json({
+      count: processes.length,
+      processes: processes.map(p => ({
+        id: p.id,
+        command: p.command.substring(0, 100),
+        status: p.status,
+      })),
+    });
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    return c.json({ error: errorMessage }, 500);
+  }
+});
+
+// POST /api/admin/debug/killall - Kill ALL processes in the sandbox
+adminApi.post('/debug/killall', async (c) => {
+  const sandbox = c.get('sandbox');
+  try {
+    // Kill absolutely everything
+    const proc = await sandbox.startProcess('pkill -9 -e . || killall -9 -r . || true');
+    await new Promise(r => setTimeout(r, 2000));
+    return c.json({ success: true, message: 'Killed all processes' });
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    return c.json({ error: errorMessage }, 500);
+  }
+});
+
+// GET /api/admin/debug/container-env - Check env vars inside the container
+adminApi.get('/debug/container-env', async (c) => {
+  const sandbox = c.get('sandbox');
+  try {
+    // Check both the env file and source it to show what the gateway would see
+    const proc = await sandbox.startProcess(`
+      echo "=== ENV FILE EXISTS ===" &&
+      ls -la /tmp/moltbot-env.sh 2>/dev/null || echo "ENV FILE NOT FOUND" &&
+      echo "" &&
+      echo "=== ENV FILE CONTENT ===" &&
+      head -5 /tmp/moltbot-env.sh 2>/dev/null || echo "CANNOT READ FILE" &&
+      echo "" &&
+      echo "=== SOURCED ENV VARS ===" &&
+      (. /tmp/moltbot-env.sh 2>/dev/null && env | grep -E "WHATSAPP|GROQ|DISCORD|CLAWDBOT" | head -10) || echo "SOURCE FAILED"
+    `);
+    await new Promise(r => setTimeout(r, 5000));
+    const logs = await proc.getLogs();
+    return c.json({
+      stdout: logs.stdout,
+      stderr: logs.stderr,
+    });
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    return c.json({ error: errorMessage }, 500);
+  }
+});
+
+// GET /api/admin/debug/gateway-logs - Get logs from the most recent gateway process
+adminApi.get('/debug/gateway-logs', async (c) => {
+  const sandbox = c.get('sandbox');
+  try {
+    const processes = await sandbox.listProcesses();
+    // Find the most recent start-moltbot.sh process (handles both direct and bash -c versions)
+    const gatewayProcesses = processes
+      .filter(p => p.command.includes('start-moltbot.sh'))
+      .sort((a, b) => {
+        const getTs = (id: string) => parseInt(id.match(/proc_(\d+)_/)?.[1] || '0', 10);
+        return getTs(b.id) - getTs(a.id);
+      });
+
+    if (gatewayProcesses.length === 0) {
+      return c.json({ error: 'No gateway process found' });
+    }
+
+    const proc = gatewayProcesses[0];
+    const logs = await proc.getLogs();
+    return c.json({
+      processId: proc.id,
+      status: proc.status,
+      command: proc.command.substring(0, 100),
+      stdout: logs.stdout?.substring(0, 5000) || '',
+      stderr: logs.stderr?.substring(0, 5000) || '',
+    });
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    return c.json({ error: errorMessage }, 500);
+  }
+});
+
+// GET /api/admin/debug/test-process - Test if we can start a simple process
+adminApi.get('/debug/test-process', async (c) => {
+  const sandbox = c.get('sandbox');
+  try {
+    console.log('Starting test process...');
+    const proc = await sandbox.startProcess('echo "Hello from sandbox" && date');
+    console.log('Process started, waiting...');
+    await new Promise(r => setTimeout(r, 2000));
+    const logs = await proc.getLogs();
+    return c.json({
+      success: true,
+      processId: proc.id,
+      status: proc.status,
+      stdout: logs.stdout,
+      stderr: logs.stderr,
+    });
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    return c.json({ error: errorMessage, stack: error instanceof Error ? error.stack : undefined }, 500);
+  }
+});
+
+// GET /api/admin/whatsapp/link - Generate WhatsApp QR code for device linking
+// Returns: { qrText: string, qrDataUrl: string, expiresIn: number }
+// Note: QR code expires in ~20 seconds, scan quickly!
+adminApi.get('/whatsapp/link', async (c) => {
+  const sandbox = c.get('sandbox');
+
+  try {
+    // Ensure moltbot is running first
+    await ensureMoltbotGateway(sandbox, c.env);
+
+    // Run clawdbot web link --json to get QR code
+    // This generates a new QR code for device linking
+    const proc = await sandbox.startProcess('clawdbot web link --json --url ws://localhost:18789');
+
+    // Wait longer for QR generation (can take a few seconds)
+    await waitForProcess(proc, 30000);
+
+    const logs = await proc.getLogs();
+    const stdout = logs.stdout || '';
+    const stderr = logs.stderr || '';
+
+    // Try to parse JSON output
+    try {
+      // Find JSON in output
+      const jsonMatch = stdout.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        const data = JSON.parse(jsonMatch[0]);
+        // data should contain { qrText, qrDataUrl, expiresIn }
+        return c.json(data);
+      }
+
+      // Check for errors
+      if (stderr.includes('already linked') || stdout.includes('already linked')) {
+        return c.json({
+          error: 'WhatsApp is already linked',
+          message: 'Device is already connected. Use /api/admin/whatsapp/logout to unlink first.',
+        }, 400);
+      }
+
+      // If no JSON found, return raw output
+      return c.json({
+        error: 'Failed to generate QR code',
+        raw: stdout,
+        stderr,
+      }, 500);
+    } catch {
+      return c.json({
+        error: 'Failed to parse QR response',
+        raw: stdout,
+        stderr,
+      }, 500);
+    }
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    return c.json({ error: errorMessage }, 500);
+  }
+});
+
+// GET /api/admin/whatsapp/status - Check WhatsApp connection status
+adminApi.get('/whatsapp/status', async (c) => {
+  const sandbox = c.get('sandbox');
+
+  try {
+    // Ensure moltbot is running first
+    await ensureMoltbotGateway(sandbox, c.env);
+
+    // Run doctor to get real channel status
+    const doctorProc = await sandbox.startProcess('clawdbot doctor');
+    await waitForProcess(doctorProc, 15000);
+    const doctorLogs = await doctorProc.getLogs();
+    const doctorStdout = doctorLogs.stdout || '';
+
+    // Parse WhatsApp status from doctor output
+    // Format: "WhatsApp: linked (auth age 1m)" or "WhatsApp: not linked"
+    const whatsappMatch = doctorStdout.match(/WhatsApp:\s*(.+)/);
+    const whatsappStatus = whatsappMatch ? whatsappMatch[1].trim() : 'unknown';
+    const isLinked = whatsappStatus.includes('linked');
+
+    // Parse web channel phone number
+    // Format: "Web Channel: +919187520828 (jid ...)"
+    const webChannelMatch = doctorStdout.match(/Web Channel:\s*(\+\d+)/);
+    const phoneNumber = webChannelMatch ? webChannelMatch[1] : null;
+
+    // Check WhatsApp config
+    const configProc = await sandbox.startProcess('cat /root/.clawdbot/clawdbot.json');
+    await waitForProcess(configProc, 5000);
+    const configLogs = await configProc.getLogs();
+    const configStdout = configLogs.stdout || '';
+
+    // Check if credentials file exists
+    const credsProc = await sandbox.startProcess('ls -la /root/.clawdbot/credentials/whatsapp/default/ 2>&1 || echo "NO_CREDS_DIR"');
+    await waitForProcess(credsProc, 5000);
+    const credsLogs = await credsProc.getLogs();
+    const credsStdout = credsLogs.stdout || '';
+
+    try {
+      const config = JSON.parse(configStdout);
+      const whatsappConfig = config.channels?.whatsapp || {};
+
+      return c.json({
+        connected: isLinked,
+        status: whatsappStatus,
+        phoneNumber,
+        dmPolicy: whatsappConfig.dmPolicy || 'not set',
+        allowFrom: whatsappConfig.allowFrom || [],
+        credentialsDir: credsStdout.includes('NO_CREDS_DIR') ? 'not found' : 'exists',
+        credentialsFiles: credsStdout,
+      });
+    } catch {
+      return c.json({
+        connected: isLinked,
+        status: whatsappStatus,
+        phoneNumber,
+        error: 'Could not parse config',
+        credentialsDir: credsStdout,
+      });
+    }
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    return c.json({ error: errorMessage }, 500);
+  }
+});
+
+// POST /api/admin/whatsapp/enable - Enable WhatsApp channel via CLI
+adminApi.post('/whatsapp/enable', async (c) => {
+  const sandbox = c.get('sandbox');
+
+  try {
+    // Ensure moltbot is running first
+    await ensureMoltbotGateway(sandbox, c.env);
+
+    // Try to enable WhatsApp channel via doctor --fix (runs offline against config)
+    const doctorProc = await sandbox.startProcess('clawdbot doctor --fix');
+    await waitForProcess(doctorProc, 30000);
+
+    const doctorLogs = await doctorProc.getLogs();
+    const doctorStdout = doctorLogs.stdout || '';
+    const doctorStderr = doctorLogs.stderr || '';
+
+    // Check if WhatsApp was enabled
+    const enabled = doctorStdout.includes('channels.whatsapp.enabled') ||
+                   doctorStdout.includes('WhatsApp enabled');
+
+    return c.json({
+      success: enabled,
+      message: enabled ? 'WhatsApp channel enabled' : 'Could not enable WhatsApp - check logs',
+      stdout: doctorStdout,
+      stderr: doctorStderr,
+    });
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    return c.json({ error: errorMessage }, 500);
+  }
+});
+
+// POST /api/admin/whatsapp/logout - Unlink WhatsApp device
+adminApi.post('/whatsapp/logout', async (c) => {
+  const sandbox = c.get('sandbox');
+
+  try {
+    // Ensure moltbot is running first
+    await ensureMoltbotGateway(sandbox, c.env);
+
+    // Run clawdbot web logout to unlink
+    const proc = await sandbox.startProcess('clawdbot web logout --url ws://localhost:18789');
+    await waitForProcess(proc, CLI_TIMEOUT_MS);
+
+    const logs = await proc.getLogs();
+    const stdout = logs.stdout || '';
+    const stderr = logs.stderr || '';
+
+    const success = stdout.toLowerCase().includes('logged out') ||
+                   stdout.toLowerCase().includes('unlinked') ||
+                   proc.exitCode === 0;
+
+    return c.json({
+      success,
+      message: success ? 'WhatsApp device unlinked' : 'Logout may have failed',
+      stdout,
+      stderr,
+    });
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    return c.json({ error: errorMessage }, 500);
+  }
+});
+
+// POST /api/admin/cli - Run clawdbot CLI command
+adminApi.post('/cli', async (c) => {
+  const sandbox = c.get('sandbox');
+  const body = await c.req.json<{ command: string }>();
+  const command = body.command;
+
+  if (!command) {
+    return c.json({ error: 'command is required' }, 400);
+  }
+
+  // Safety check - only allow clawdbot commands
+  if (!command.startsWith('clawdbot ')) {
+    return c.json({ error: 'Only clawdbot commands are allowed' }, 400);
+  }
+
+  try {
+    // Ensure moltbot is running first
+    await ensureMoltbotGateway(sandbox, c.env);
+
+    // Commands that don't need --url flag
+    // Most commands work against the local gateway without needing --url
+    const offlineCommands = ['config get', 'config set', 'config unset', '--help', '--version', 'doctor', 'message', 'channels'];
+    const needsUrl = !offlineCommands.some(cmd => command.includes(cmd));
+    const fullCommand = needsUrl ? `${command} --url ws://localhost:18789` : command;
+
+    const proc = await sandbox.startProcess(fullCommand);
+    await waitForProcess(proc, CLI_TIMEOUT_MS);
+
+    const logs = await proc.getLogs();
+    return c.json({
+      exitCode: proc.exitCode,
+      stdout: logs.stdout || '',
+      stderr: logs.stderr || '',
+    });
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    return c.json({ error: errorMessage }, 500);
+  }
+});
+
 // POST /api/admin/gateway/restart - Kill the current gateway and start a new one
 adminApi.post('/gateway/restart', async (c) => {
   const sandbox = c.get('sandbox');

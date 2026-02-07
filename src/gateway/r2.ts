@@ -1,6 +1,10 @@
 import type { Sandbox } from '@cloudflare/sandbox';
 import type { MoltbotEnv } from '../types';
 import { R2_MOUNT_PATH, getR2BucketName } from '../config';
+import { buildEnvVars } from './env';
+
+/** Path to secrets file in R2 mount */
+export const R2_SECRETS_PATH = `${R2_MOUNT_PATH}/secrets.env`;
 
 /**
  * Check if R2 is already mounted by looking at the mount table
@@ -70,6 +74,49 @@ export async function mountR2Storage(sandbox: Sandbox, env: MoltbotEnv): Promise
     
     // Don't fail if mounting fails - moltbot can still run without persistent storage
     console.error('Failed to mount R2 bucket:', err);
+    return false;
+  }
+}
+
+/**
+ * Write secrets to R2 bucket as a sourceable env file.
+ *
+ * This is a workaround for Cloudflare Sandbox not properly passing
+ * environment variables to container processes. Instead, we write
+ * the secrets to R2, and the container sources them from the R2 mount.
+ *
+ * @param env - Worker environment bindings
+ * @returns true if secrets were written successfully
+ */
+export async function writeSecretsToR2(env: MoltbotEnv): Promise<boolean> {
+  if (!env.R2_STORAGE) {
+    console.log('[R2] No R2_STORAGE binding, cannot write secrets');
+    return false;
+  }
+
+  const envVars = buildEnvVars(env);
+  if (Object.keys(envVars).length === 0) {
+    console.log('[R2] No secrets to write');
+    return false;
+  }
+
+  // Build shell-sourceable content with proper escaping
+  const lines = Object.entries(envVars).map(([key, value]) => {
+    // Escape single quotes in value by replacing ' with '\''
+    const escapedValue = value.replace(/'/g, "'\\''");
+    return `export ${key}='${escapedValue}'`;
+  });
+  const content = lines.join('\n') + '\n';
+
+  try {
+    // Write to R2 bucket at secrets.env path
+    await env.R2_STORAGE.put('secrets.env', content, {
+      httpMetadata: { contentType: 'text/plain' },
+    });
+    console.log(`[R2] Wrote ${Object.keys(envVars).length} secrets to R2 (secrets.env)`);
+    return true;
+  } catch (err) {
+    console.error('[R2] Failed to write secrets:', err);
     return false;
   }
 }

@@ -1,10 +1,11 @@
 #!/bin/bash
 # Startup script for Moltbot in Cloudflare Sandbox
 # This script:
-# 1. Restores config from R2 backup if available
-# 2. Configures moltbot from environment variables
-# 3. Starts a background sync to backup config to R2
-# 4. Starts the gateway
+# 1. Sources secrets from R2 mount (workaround for env var passing)
+# 2. Restores config from R2 backup if available
+# 3. Configures moltbot from environment variables
+# 4. Starts a background sync to backup config to R2
+# 5. Starts the gateway
 
 set -e
 
@@ -21,6 +22,20 @@ CONFIG_FILE="$CONFIG_DIR/clawdbot.json"
 TEMPLATE_DIR="/root/.clawdbot-templates"
 TEMPLATE_FILE="$TEMPLATE_DIR/moltbot.json.template"
 BACKUP_DIR="/data/moltbot"
+
+# ============================================================
+# SOURCE SECRETS FROM R2 MOUNT
+# ============================================================
+# Workaround: Cloudflare Sandbox doesn't pass env vars to container.
+# The Worker writes secrets to R2, and we source them here.
+SECRETS_FILE="$BACKUP_DIR/secrets.env"
+if [ -f "$SECRETS_FILE" ]; then
+    echo "Sourcing secrets from R2 mount..."
+    . "$SECRETS_FILE"
+    echo "Loaded secrets from R2"
+else
+    echo "No secrets file found at $SECRETS_FILE"
+fi
 
 echo "Config directory: $CONFIG_DIR"
 echo "Backup directory: $BACKUP_DIR"
@@ -131,6 +146,19 @@ else
 fi
 
 # ============================================================
+# EXTRACT WHATSAPP CREDENTIALS FROM SECRET
+# ============================================================
+# Baileys stores credentials in creds.json (~2-5KB)
+# We store this base64-encoded in WHATSAPP_CREDS_JSON secret
+if [ -n "$WHATSAPP_CREDS_JSON" ]; then
+    WHATSAPP_CREDS_DIR="/root/.clawdbot/credentials/whatsapp/default"
+    echo "Extracting WhatsApp credentials to $WHATSAPP_CREDS_DIR..."
+    mkdir -p "$WHATSAPP_CREDS_DIR"
+    echo "$WHATSAPP_CREDS_JSON" | base64 -d > "$WHATSAPP_CREDS_DIR/creds.json"
+    echo "WhatsApp credentials extracted"
+fi
+
+# ============================================================
 # UPDATE CONFIG FROM ENVIRONMENT VARIABLES
 # ============================================================
 node << EOFNODE
@@ -231,6 +259,26 @@ if (process.env.SLACK_BOT_TOKEN && process.env.SLACK_APP_TOKEN) {
     config.channels.slack.botToken = process.env.SLACK_BOT_TOKEN;
     config.channels.slack.appToken = process.env.SLACK_APP_TOKEN;
     config.channels.slack.enabled = true;
+}
+
+// WhatsApp configuration (Baileys)
+// Note: Don't set 'enabled' directly - clawdbot doctor handles that.
+// We just configure dmPolicy and allowFrom, then doctor --fix enables it.
+if (process.env.WHATSAPP_ENABLED === 'true') {
+    console.log('Configuring WhatsApp channel...');
+    config.channels.whatsapp = config.channels.whatsapp || {};
+
+    // DM policy: 'allowlist', 'pairing', or 'open'
+    const whatsappDmPolicy = process.env.WHATSAPP_DM_POLICY || 'allowlist';
+    config.channels.whatsapp.dmPolicy = whatsappDmPolicy;
+
+    if (process.env.WHATSAPP_ALLOW_FROM) {
+        // Explicit allowlist: "+1234567890,+0987654321" → ['+1234567890', '+0987654321']
+        config.channels.whatsapp.allowFrom = process.env.WHATSAPP_ALLOW_FROM.split(',').map(s => s.trim());
+        console.log('WhatsApp allowlist:', config.channels.whatsapp.allowFrom);
+    } else if (whatsappDmPolicy === 'open') {
+        config.channels.whatsapp.allowFrom = ['*'];
+    }
 }
 
 // Base URL override (e.g., for Cloudflare AI Gateway)
