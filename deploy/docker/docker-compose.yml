@@ -1,0 +1,92 @@
+# OpenClaw Multi-Tenant Docker Compose
+# Orchestrates isolated OpenClaw gateways for multiple tenants
+#
+# Usage:
+#   docker compose up -d              # Start all tenants
+#   docker compose up -d tenant-1     # Start specific tenant
+#   docker compose logs -f tenant-1   # View logs
+#   docker compose down               # Stop all
+
+version: '3.8'
+
+# Common settings shared by all tenant services
+x-common-settings: &common-settings
+  image: openclaw:2026.2.3
+  restart: always
+  # Bridge network - egress only, no inter-container communication
+  network_mode: bridge
+  # Security hardening
+  cap_drop:
+    - ALL
+  cap_add:
+    - NET_BIND_SERVICE
+  security_opt:
+    - no-new-privileges:true
+  # Resource limits per container
+  deploy:
+    resources:
+      limits:
+        cpus: '2.0'
+        memory: 2G
+      reservations:
+        cpus: '0.5'
+        memory: 512M
+
+services:
+  # Tenants are added here by add-to-compose.sh
+  # Example entry:
+  #
+  # my-tenant:
+  #   <<: *common-settings
+  #   container_name: openclaw-my-tenant
+  #   env_file:
+  #     - /data/my-tenant/secrets.env
+  #   environment:
+  #     - CLAWDBOT_GATEWAY_PORT=18789
+  #   volumes:
+  #     - /data/my-tenant/.openclaw:/root/.openclaw
+  #     - /data/shared/skills:/root/clawd/skills:ro
+  #     - /data/shared/plugins:/root/clawd/plugins:ro
+  #   ports:
+  #     - "18790:18789"
+
+  test-tenant:
+    image: openclaw:2026.2.3
+    container_name: openclaw-test-tenant
+    restart: always
+    # Use host network for simpler port binding
+    network_mode: host
+    env_file:
+      - /data/test-tenant/secrets.env
+    environment:
+      - OPENCLAW_GATEWAY_PORT=18789
+    volumes:
+      - /data/test-tenant/.openclaw:/root/.openclaw
+    # Enable tty for interactive OAuth login
+    tty: true
+    stdin_open: true
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 2G
+
+  perhitbot:
+    image: openclaw:2026.2.3
+    container_name: openclaw-perhitbot
+    restart: always
+    network_mode: host
+    env_file:
+      - /data/perhitbot/secrets.env
+    environment:
+      - OPENCLAW_GATEWAY_PORT=18790
+    volumes:
+      - /data/perhitbot/.openclaw:/root/.openclaw
+    tty: true
+    stdin_open: true
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 2G

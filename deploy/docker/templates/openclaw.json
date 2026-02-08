@@ -1,0 +1,35 @@
+{
+  "$schema": "https://openclaw.dev/schemas/config.json",
+  "version": "2026.2.3",
+  "gateway": {
+    "port": {{GATEWAY_PORT}},
+    "host": "0.0.0.0"
+  },
+  "model": {
+    "provider": "anthropic",
+    "model": "claude-sonnet-4-5-20250929",
+    "maxTokens": 4096
+  },
+  "agents": [
+    {
+      "name": "{{AGENT_NAME}}",
+      "description": "{{AGENT_DESCRIPTION}}",
+      "systemPrompt": "You are {{AGENT_NAME}}, a helpful AI assistant."
+    }
+  ],
+  "channels": {
+    "whatsapp": {
+      "account": "default",
+      "dmPolicy": "allowlist",
+      "allowFrom": []
+    },
+    "discord": {
+      "enabled": false,
+      "token": ""
+    }
+  },
+  "memory": {
+    "enabled": true,
+    "provider": "local"
+  }
+}

@@ -1,17 +1,34 @@
 # Deployment Configs
 
-Reference configurations for running OpenClaw agents on Linux with systemd.
+Two deployment options for running OpenClaw agents:
+
+1. **Systemd** (`systemd/`, `agents/`) - Direct installation, simpler for single-server
+2. **Docker** (`docker/`) - Multi-tenant isolation, better for multiple clients
+
+## Quick Reference
+
+| Option | Use Case | Isolation | Setup Complexity |
+|--------|----------|-----------|------------------|
+| Systemd | Single org, 1-2 agents | Shared filesystem | Lower |
+| Docker | Multi-tenant, client isolation | Full container isolation | Higher |
 
 ## Structure
 
 ```
 deploy/
-├── systemd/
+├── systemd/                      # Systemd service files
 │   ├── clawdbot-gateway.service  # Nyx agent (port 18789)
 │   └── clawdbot-perhit.service   # PerhitBot agent (port 18790)
-└── agents/
-    ├── nyx.openclaw.json         # Nyx config
-    └── perhitbot.openclaw.json   # PerhitBot config
+├── agents/                       # OpenClaw configs
+│   ├── nyx.openclaw.json
+│   └── perhitbot.openclaw.json
+└── docker/                       # Docker multi-tenant setup
+    ├── Dockerfile
+    ├── docker-compose.yml
+    ├── provision-tenant.sh
+    ├── add-to-compose.sh
+    ├── link-whatsapp.sh
+    └── templates/
 ```
 
 ## Setup
@@ -81,3 +98,32 @@ See MEMORY.md for the full "Docker→Systemd File Ownership Bug" documentation.
 |-----------|-------|-------------|
 | Nyx       | 18789 | Primary agent |
 | PerhitBot | 18790 | Perhit student DB |
+
+---
+
+## Docker Multi-Tenant Setup
+
+For running multiple isolated tenants, see `docker/README.md`.
+
+```bash
+cd deploy/docker
+
+# Build image
+./build-image.sh
+
+# Provision tenant
+./provision-tenant.sh acme --anthropic-key sk-ant-xxx
+
+# Add to compose and start
+./add-to-compose.sh acme 18791
+docker compose up -d acme
+
+# Link WhatsApp
+./link-whatsapp.sh acme
+```
+
+Each tenant gets:
+- Isolated container with own credentials
+- Separate WhatsApp/Discord sessions
+- Resource limits (2 CPU, 2GB RAM)
+- Security hardening (dropped caps, no-new-privileges)
