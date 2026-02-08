@@ -9,6 +9,20 @@ import { synthesizeSpeech, getAvailableVoices, getAvailableModels, DEFAULT_TTS_M
 // CLI commands can take 10-15 seconds to complete due to WebSocket connection overhead
 const CLI_TIMEOUT_MS = 20000;
 
+// Input validation helpers to prevent shell injection
+function isValidIdentifier(value: string): boolean {
+  // Only allow alphanumeric, dash, underscore, colon (for session keys)
+  return /^[a-zA-Z0-9_:-]+$/.test(value) && value.length <= 256;
+}
+
+function isValidSessionKey(key: string): boolean {
+  // Session keys: alphanumeric with some allowed separators, no path traversal
+  return /^[a-zA-Z0-9_:.-]+$/.test(key) && !key.includes('..') && key.length <= 256;
+}
+
+// Known valid providers for model testing
+const VALID_PROVIDERS = ['anthropic', 'openai', 'groq', 'ollama', 'azure'] as const;
+
 /**
  * API routes
  * - /api/admin/* - Protected admin API routes (Cloudflare Access required)
@@ -746,6 +760,725 @@ adminApi.get('/tts/voices', async (c) => {
     },
     provider: 'openai',
   });
+});
+
+// ============================================
+// Sessions API (Phase 1)
+// ============================================
+
+// GET /api/admin/sessions - List sessions with metadata
+adminApi.get('/sessions', async (c) => {
+  const sandbox = c.get('sandbox');
+
+  try {
+    await ensureMoltbotGateway(sandbox, c.env);
+
+    const limit = c.req.query('limit') || '50';
+    const activeMinutes = c.req.query('activeMinutes') || '60';
+
+    // Use clawdbot sessions command
+    const proc = await sandbox.startProcess(
+      `clawdbot sessions --json --active ${activeMinutes} --url ws://localhost:18789`
+    );
+    await waitForProcess(proc, CLI_TIMEOUT_MS);
+
+    const logs = await proc.getLogs();
+    const stdout = logs.stdout || '';
+
+    // Try to parse JSON array from output
+    const jsonMatch = stdout.match(/\[[\s\S]*\]/);
+    if (jsonMatch) {
+      const sessions = JSON.parse(jsonMatch[0]);
+      // Apply limit
+      const limitNum = parseInt(limit, 10);
+      return c.json({
+        sessions: sessions.slice(0, limitNum),
+        total: sessions.length,
+      });
+    }
+
+    // Fallback: return raw output
+    return c.json({
+      sessions: [],
+      raw: stdout,
+      stderr: logs.stderr || '',
+    });
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    return c.json({ error: errorMessage }, 500);
+  }
+});
+
+// GET /api/admin/sessions/:sessionKey/history - Get message history for a session
+adminApi.get('/sessions/:sessionKey/history', async (c) => {
+  const sandbox = c.get('sandbox');
+  const sessionKey = c.req.param('sessionKey');
+  const limit = Math.min(Math.max(parseInt(c.req.query('limit') || '200', 10) || 200, 1), 1000);
+
+  if (!sessionKey || !isValidSessionKey(sessionKey)) {
+    return c.json({ error: 'Invalid sessionKey format' }, 400);
+  }
+
+  try {
+    await ensureMoltbotGateway(sandbox, c.env);
+
+    // Read session file directly (JSONL format)
+    const sessionPath = `/root/.clawdbot/sessions/${sessionKey}.jsonl`;
+    const proc = await sandbox.startProcess(`cat "${sessionPath}" 2>/dev/null || echo "SESSION_NOT_FOUND"`);
+    await waitForProcess(proc, CLI_TIMEOUT_MS);
+
+    const logs = await proc.getLogs();
+    const stdout = logs.stdout || '';
+
+    if (stdout.includes('SESSION_NOT_FOUND')) {
+      return c.json({ error: 'Session not found', sessionKey }, 404);
+    }
+
+    // Parse JSONL - each line is a message
+    const messages = stdout
+      .trim()
+      .split('\n')
+      .filter(line => line.trim())
+      .map(line => {
+        try {
+          return JSON.parse(line);
+        } catch {
+          return null;
+        }
+      })
+      .filter(Boolean);
+
+    // Apply limit (get last N messages)
+    const limitedMessages = messages.slice(-limit);
+
+    return c.json({
+      sessionKey,
+      messages: limitedMessages,
+      total: messages.length,
+      limited: messages.length > limit,
+    });
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    return c.json({ error: errorMessage }, 500);
+  }
+});
+
+// GET /api/admin/sessions/:sessionKey/preview - Get preview snippets of recent messages
+adminApi.get('/sessions/:sessionKey/preview', async (c) => {
+  const sandbox = c.get('sandbox');
+  const sessionKey = c.req.param('sessionKey');
+  const limit = Math.min(Math.max(parseInt(c.req.query('limit') || '5', 10) || 5, 1), 50);
+  const maxChars = Math.min(Math.max(parseInt(c.req.query('maxChars') || '200', 10) || 200, 1), 1000);
+
+  if (!sessionKey || !isValidSessionKey(sessionKey)) {
+    return c.json({ error: 'Invalid sessionKey format' }, 400);
+  }
+
+  try {
+    await ensureMoltbotGateway(sandbox, c.env);
+
+    // Read session file directly
+    const sessionPath = `/root/.clawdbot/sessions/${sessionKey}.jsonl`;
+    const proc = await sandbox.startProcess(`tail -${limit * 2} "${sessionPath}" 2>/dev/null || echo "SESSION_NOT_FOUND"`);
+    await waitForProcess(proc, CLI_TIMEOUT_MS);
+
+    const logs = await proc.getLogs();
+    const stdout = logs.stdout || '';
+
+    if (stdout.includes('SESSION_NOT_FOUND')) {
+      return c.json({ error: 'Session not found', sessionKey }, 404);
+    }
+
+    // Parse JSONL and extract previews
+    const messages = stdout
+      .trim()
+      .split('\n')
+      .filter(line => line.trim())
+      .map(line => {
+        try {
+          return JSON.parse(line);
+        } catch {
+          return null;
+        }
+      })
+      .filter(Boolean)
+      .slice(-limit);
+
+    const previews = messages.map((msg: Record<string, unknown>) => ({
+      role: msg.role || 'unknown',
+      preview: typeof msg.content === 'string'
+        ? msg.content.substring(0, maxChars) + (msg.content.length > maxChars ? '...' : '')
+        : '[non-text content]',
+      timestamp: msg.timestamp || msg.createdAt || null,
+    }));
+
+    return c.json({
+      sessionKey,
+      previews,
+      count: previews.length,
+    });
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    return c.json({ error: errorMessage }, 500);
+  }
+});
+
+// ============================================
+// Skills API (Phase 3)
+// ============================================
+
+// GET /api/admin/skills - List all skills with status
+adminApi.get('/skills', async (c) => {
+  const sandbox = c.get('sandbox');
+
+  try {
+    await ensureMoltbotGateway(sandbox, c.env);
+
+    const eligible = c.req.query('eligible');
+    const cmd = eligible === 'true'
+      ? 'clawdbot skills list --json --eligible --url ws://localhost:18789'
+      : 'clawdbot skills list --json --url ws://localhost:18789';
+
+    const proc = await sandbox.startProcess(cmd);
+    await waitForProcess(proc, CLI_TIMEOUT_MS);
+
+    const logs = await proc.getLogs();
+    const stdout = logs.stdout || '';
+
+    // Try to parse JSON array or object
+    const jsonMatch = stdout.match(/[\[\{][\s\S]*[\]\}]/);
+    if (jsonMatch) {
+      const data = JSON.parse(jsonMatch[0]);
+      return c.json(Array.isArray(data) ? { skills: data } : data);
+    }
+
+    return c.json({
+      skills: [],
+      raw: stdout,
+      stderr: logs.stderr || '',
+    });
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    return c.json({ error: errorMessage }, 500);
+  }
+});
+
+// GET /api/admin/skills/:name - Get details about a specific skill
+adminApi.get('/skills/:name', async (c) => {
+  const sandbox = c.get('sandbox');
+  const name = c.req.param('name');
+
+  if (!name || !isValidIdentifier(name)) {
+    return c.json({ error: 'Invalid skill name. Only alphanumeric, dash, and underscore allowed.' }, 400);
+  }
+
+  try {
+    await ensureMoltbotGateway(sandbox, c.env);
+
+    const proc = await sandbox.startProcess(
+      `clawdbot skills info ${name} --json --url ws://localhost:18789`
+    );
+    await waitForProcess(proc, CLI_TIMEOUT_MS);
+
+    const logs = await proc.getLogs();
+    const stdout = logs.stdout || '';
+
+    const jsonMatch = stdout.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      return c.json(JSON.parse(jsonMatch[0]));
+    }
+
+    // Check for "not found" type errors
+    if (stdout.includes('not found') || logs.stderr?.includes('not found')) {
+      return c.json({ error: 'Skill not found', name }, 404);
+    }
+
+    return c.json({
+      name,
+      raw: stdout,
+      stderr: logs.stderr || '',
+    });
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    return c.json({ error: errorMessage }, 500);
+  }
+});
+
+// POST /api/admin/skills/:name/install - Install a skill dependency
+adminApi.post('/skills/:name/install', async (c) => {
+  const sandbox = c.get('sandbox');
+  const name = c.req.param('name');
+  const body = await c.req.json<{ installId?: string }>().catch(() => ({} as { installId?: string }));
+
+  if (!name || !isValidIdentifier(name)) {
+    return c.json({ error: 'Invalid skill name. Only alphanumeric, dash, and underscore allowed.' }, 400);
+  }
+
+  // Validate installId if provided
+  if (body.installId && !isValidIdentifier(body.installId)) {
+    return c.json({ error: 'Invalid installId format' }, 400);
+  }
+
+  try {
+    await ensureMoltbotGateway(sandbox, c.env);
+
+    // If installId provided, install that specific dependency
+    const cmd = body.installId
+      ? `clawdbot skills install ${name} ${body.installId} --url ws://localhost:18789`
+      : `clawdbot skills install ${name} --url ws://localhost:18789`;
+
+    const proc = await sandbox.startProcess(cmd);
+    await waitForProcess(proc, 60000); // Allow longer for installs
+
+    const logs = await proc.getLogs();
+    const stdout = logs.stdout || '';
+    const stderr = logs.stderr || '';
+
+    const success = proc.exitCode === 0 ||
+                   stdout.toLowerCase().includes('installed') ||
+                   stdout.toLowerCase().includes('success');
+
+    return c.json({
+      success,
+      skill: name,
+      installId: body.installId,
+      stdout,
+      stderr,
+    });
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    return c.json({ error: errorMessage }, 500);
+  }
+});
+
+// POST /api/admin/skills/:name/enable - Enable/disable a skill
+adminApi.post('/skills/:name/enable', async (c) => {
+  const sandbox = c.get('sandbox');
+  const name = c.req.param('name');
+  const body = await c.req.json<{ enabled?: boolean; apiKey?: string }>().catch(() => ({} as { enabled?: boolean; apiKey?: string }));
+
+  if (!name || !isValidIdentifier(name)) {
+    return c.json({ error: 'Invalid skill name. Only alphanumeric, dash, and underscore allowed.' }, 400);
+  }
+
+  // Validate apiKey format if provided (alphanumeric, dash, underscore only for safety)
+  if (body.apiKey && !/^[a-zA-Z0-9_-]+$/.test(body.apiKey)) {
+    return c.json({ error: 'Invalid API key format. Only alphanumeric, dash, and underscore allowed.' }, 400);
+  }
+
+  try {
+    await ensureMoltbotGateway(sandbox, c.env);
+
+    // Build command based on what's being set
+    let cmd = `clawdbot skills config ${name}`;
+    if (typeof body.enabled === 'boolean') {
+      cmd += body.enabled ? ' --enable' : ' --disable';
+    }
+    if (body.apiKey) {
+      cmd += ` --api-key "${body.apiKey}"`;
+    }
+    cmd += ' --url ws://localhost:18789';
+
+    const proc = await sandbox.startProcess(cmd);
+    await waitForProcess(proc, CLI_TIMEOUT_MS);
+
+    const logs = await proc.getLogs();
+    const stdout = logs.stdout || '';
+    const stderr = logs.stderr || '';
+
+    const success = proc.exitCode === 0;
+
+    return c.json({
+      success,
+      skill: name,
+      enabled: body.enabled,
+      stdout,
+      stderr,
+    });
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    return c.json({ error: errorMessage }, 500);
+  }
+});
+
+// ============================================
+// Memory/Embeddings API (Phase 2)
+// ============================================
+
+// GET /api/admin/memory/status - Get memory index status
+adminApi.get('/memory/status', async (c) => {
+  const sandbox = c.get('sandbox');
+
+  try {
+    await ensureMoltbotGateway(sandbox, c.env);
+
+    const proc = await sandbox.startProcess('clawdbot memory status --json --url ws://localhost:18789');
+    await waitForProcess(proc, CLI_TIMEOUT_MS);
+
+    const logs = await proc.getLogs();
+    const stdout = logs.stdout || '';
+
+    const jsonMatch = stdout.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      return c.json(JSON.parse(jsonMatch[0]));
+    }
+
+    return c.json({
+      status: 'unknown',
+      raw: stdout,
+      stderr: logs.stderr || '',
+    });
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    return c.json({ error: errorMessage }, 500);
+  }
+});
+
+// POST /api/admin/memory/search - Search memory with embeddings
+adminApi.post('/memory/search', async (c) => {
+  const sandbox = c.get('sandbox');
+  const body = await c.req.json<{
+    query: string;
+    maxResults?: number;
+    minScore?: number;
+  }>().catch(() => ({ query: '' } as { query: string; maxResults?: number; minScore?: number }));
+
+  if (!body.query?.trim()) {
+    return c.json({ error: 'query is required' }, 400);
+  }
+
+  try {
+    await ensureMoltbotGateway(sandbox, c.env);
+
+    const maxResults = body.maxResults || 10;
+    const minScore = body.minScore || 0.5;
+
+    // Escape query for shell
+    const escapedQuery = body.query.replace(/'/g, "'\\''");
+    const proc = await sandbox.startProcess(
+      `clawdbot memory search '${escapedQuery}' --json --max-results ${maxResults} --min-score ${minScore} --url ws://localhost:18789`
+    );
+    await waitForProcess(proc, CLI_TIMEOUT_MS);
+
+    const logs = await proc.getLogs();
+    const stdout = logs.stdout || '';
+
+    // Try to parse array or object response
+    const jsonMatch = stdout.match(/[\[\{][\s\S]*[\]\}]/);
+    if (jsonMatch) {
+      const data = JSON.parse(jsonMatch[0]);
+      return c.json(Array.isArray(data) ? { results: data } : data);
+    }
+
+    return c.json({
+      results: [],
+      raw: stdout,
+      stderr: logs.stderr || '',
+    });
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    return c.json({ error: errorMessage }, 500);
+  }
+});
+
+// POST /api/admin/memory/sync - Trigger memory reindex
+adminApi.post('/memory/sync', async (c) => {
+  const sandbox = c.get('sandbox');
+  const body = await c.req.json<{ force?: boolean }>().catch(() => ({} as { force?: boolean }));
+
+  try {
+    await ensureMoltbotGateway(sandbox, c.env);
+
+    const cmd = body.force
+      ? 'clawdbot memory index --force --url ws://localhost:18789'
+      : 'clawdbot memory index --url ws://localhost:18789';
+
+    const proc = await sandbox.startProcess(cmd);
+    await waitForProcess(proc, 60000); // Allow longer for indexing
+
+    const logs = await proc.getLogs();
+    const stdout = logs.stdout || '';
+    const stderr = logs.stderr || '';
+
+    const success = proc.exitCode === 0 ||
+                   stdout.toLowerCase().includes('indexed') ||
+                   stdout.toLowerCase().includes('complete');
+
+    return c.json({
+      success,
+      force: body.force || false,
+      stdout,
+      stderr,
+    });
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    return c.json({ error: errorMessage }, 500);
+  }
+});
+
+// GET /api/admin/memory/files - List indexed memory files
+adminApi.get('/memory/files', async (c) => {
+  const sandbox = c.get('sandbox');
+
+  try {
+    await ensureMoltbotGateway(sandbox, c.env);
+
+    const proc = await sandbox.startProcess('clawdbot memory files --json --url ws://localhost:18789');
+    await waitForProcess(proc, CLI_TIMEOUT_MS);
+
+    const logs = await proc.getLogs();
+    const stdout = logs.stdout || '';
+
+    const jsonMatch = stdout.match(/[\[\{][\s\S]*[\]\}]/);
+    if (jsonMatch) {
+      const data = JSON.parse(jsonMatch[0]);
+      return c.json(Array.isArray(data) ? { files: data } : data);
+    }
+
+    return c.json({
+      files: [],
+      raw: stdout,
+      stderr: logs.stderr || '',
+    });
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    return c.json({ error: errorMessage }, 500);
+  }
+});
+
+// ============================================
+// Additional Channel Status APIs (Phase 4)
+// ============================================
+
+// GET /api/admin/telegram/status - Check Telegram bot status
+adminApi.get('/telegram/status', async (c) => {
+  const sandbox = c.get('sandbox');
+
+  try {
+    await ensureMoltbotGateway(sandbox, c.env);
+
+    // Check config for telegram settings
+    const configProc = await sandbox.startProcess('cat /root/.clawdbot/clawdbot.json');
+    await waitForProcess(configProc, 5000);
+    const configLogs = await configProc.getLogs();
+    const configStdout = configLogs.stdout || '';
+
+    // Run doctor to get status
+    const doctorProc = await sandbox.startProcess('clawdbot doctor');
+    await waitForProcess(doctorProc, 15000);
+    const doctorLogs = await doctorProc.getLogs();
+    const doctorStdout = doctorLogs.stdout || '';
+
+    // Parse Telegram status from doctor output
+    const telegramMatch = doctorStdout.match(/Telegram:\s*(.+)/);
+    const telegramStatus = telegramMatch ? telegramMatch[1].trim() : 'not configured';
+
+    try {
+      const config = JSON.parse(configStdout);
+      const telegramConfig = config.channels?.telegram || {};
+
+      return c.json({
+        configured: !!telegramConfig.botToken || !!c.env.TELEGRAM_BOT_TOKEN,
+        status: telegramStatus,
+        enabled: telegramConfig.enabled !== false,
+        hasToken: !!telegramConfig.botToken || !!c.env.TELEGRAM_BOT_TOKEN,
+      });
+    } catch {
+      return c.json({
+        configured: !!c.env.TELEGRAM_BOT_TOKEN,
+        status: telegramStatus,
+        error: 'Could not parse config',
+      });
+    }
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    return c.json({ error: errorMessage }, 500);
+  }
+});
+
+// GET /api/admin/slack/status - Check Slack bot status
+adminApi.get('/slack/status', async (c) => {
+  const sandbox = c.get('sandbox');
+
+  try {
+    await ensureMoltbotGateway(sandbox, c.env);
+
+    // Check config for slack settings
+    const configProc = await sandbox.startProcess('cat /root/.clawdbot/clawdbot.json');
+    await waitForProcess(configProc, 5000);
+    const configLogs = await configProc.getLogs();
+    const configStdout = configLogs.stdout || '';
+
+    // Run doctor to get status
+    const doctorProc = await sandbox.startProcess('clawdbot doctor');
+    await waitForProcess(doctorProc, 15000);
+    const doctorLogs = await doctorProc.getLogs();
+    const doctorStdout = doctorLogs.stdout || '';
+
+    // Parse Slack status from doctor output
+    const slackMatch = doctorStdout.match(/Slack:\s*(.+)/);
+    const slackStatus = slackMatch ? slackMatch[1].trim() : 'not configured';
+
+    try {
+      const config = JSON.parse(configStdout);
+      const slackConfig = config.channels?.slack || {};
+
+      return c.json({
+        configured: !!slackConfig.botToken || !!c.env.SLACK_BOT_TOKEN,
+        status: slackStatus,
+        enabled: slackConfig.enabled !== false,
+        hasToken: !!slackConfig.botToken || !!c.env.SLACK_BOT_TOKEN,
+        hasAppToken: !!slackConfig.appToken || !!c.env.SLACK_APP_TOKEN,
+      });
+    } catch {
+      return c.json({
+        configured: !!c.env.SLACK_BOT_TOKEN,
+        status: slackStatus,
+        error: 'Could not parse config',
+      });
+    }
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    return c.json({ error: errorMessage }, 500);
+  }
+});
+
+// GET /api/admin/discord/status - Check Discord bot status
+adminApi.get('/discord/status', async (c) => {
+  const sandbox = c.get('sandbox');
+
+  try {
+    await ensureMoltbotGateway(sandbox, c.env);
+
+    // Check config for discord settings
+    const configProc = await sandbox.startProcess('cat /root/.clawdbot/clawdbot.json');
+    await waitForProcess(configProc, 5000);
+    const configLogs = await configProc.getLogs();
+    const configStdout = configLogs.stdout || '';
+
+    // Run doctor to get status
+    const doctorProc = await sandbox.startProcess('clawdbot doctor');
+    await waitForProcess(doctorProc, 15000);
+    const doctorLogs = await doctorProc.getLogs();
+    const doctorStdout = doctorLogs.stdout || '';
+
+    // Parse Discord status from doctor output
+    const discordMatch = doctorStdout.match(/Discord:\s*(.+)/);
+    const discordStatus = discordMatch ? discordMatch[1].trim() : 'not configured';
+
+    try {
+      const config = JSON.parse(configStdout);
+      const discordConfig = config.channels?.discord || {};
+
+      return c.json({
+        configured: !!discordConfig.token || !!c.env.DISCORD_BOT_TOKEN,
+        status: discordStatus,
+        enabled: discordConfig.enabled !== false,
+        hasToken: !!discordConfig.token || !!c.env.DISCORD_BOT_TOKEN,
+      });
+    } catch {
+      return c.json({
+        configured: !!c.env.DISCORD_BOT_TOKEN,
+        status: discordStatus,
+        error: 'Could not parse config',
+      });
+    }
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    return c.json({ error: errorMessage }, 500);
+  }
+});
+
+// ============================================
+// Models API (Phase 4b)
+// ============================================
+
+// GET /api/admin/models - List configured models/providers
+adminApi.get('/models', async (c) => {
+  const sandbox = c.get('sandbox');
+
+  try {
+    await ensureMoltbotGateway(sandbox, c.env);
+
+    // Read config to see model settings
+    const configProc = await sandbox.startProcess('cat /root/.clawdbot/clawdbot.json');
+    await waitForProcess(configProc, 5000);
+    const configLogs = await configProc.getLogs();
+    const configStdout = configLogs.stdout || '';
+
+    try {
+      const config = JSON.parse(configStdout);
+      const llm = config.llm || {};
+
+      return c.json({
+        provider: llm.provider || 'anthropic',
+        model: llm.model || 'claude-sonnet-4-5-20250929',
+        configured: {
+          anthropic: !!c.env.ANTHROPIC_API_KEY,
+          openai: !!c.env.OPENAI_API_KEY,
+          groq: !!c.env.GROQ_API_KEY,
+        },
+        settings: {
+          maxTokens: llm.maxTokens,
+          temperature: llm.temperature,
+        },
+      });
+    } catch {
+      return c.json({
+        error: 'Could not parse config',
+        raw: configStdout,
+      });
+    }
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    return c.json({ error: errorMessage }, 500);
+  }
+});
+
+// POST /api/admin/models/test - Test model availability
+adminApi.post('/models/test', async (c) => {
+  const sandbox = c.get('sandbox');
+  const body = await c.req.json<{ provider?: string; model?: string }>().catch(() => ({} as { provider?: string; model?: string }));
+
+  // Validate provider
+  const provider = body.provider || 'anthropic';
+  if (!VALID_PROVIDERS.includes(provider as typeof VALID_PROVIDERS[number])) {
+    return c.json({ error: `Invalid provider. Must be one of: ${VALID_PROVIDERS.join(', ')}` }, 400);
+  }
+
+  // Validate model name format
+  const model = body.model || 'claude-sonnet-4-5-20250929';
+  if (!isValidIdentifier(model)) {
+    return c.json({ error: 'Invalid model name format' }, 400);
+  }
+
+  try {
+    await ensureMoltbotGateway(sandbox, c.env);
+
+    const proc = await sandbox.startProcess(
+      `clawdbot model test --provider ${provider} --model ${model} --url ws://localhost:18789`
+    );
+    await waitForProcess(proc, 30000);
+
+    const logs = await proc.getLogs();
+    const stdout = logs.stdout || '';
+    const stderr = logs.stderr || '';
+
+    const success = proc.exitCode === 0 ||
+                   stdout.toLowerCase().includes('success') ||
+                   stdout.toLowerCase().includes('ok');
+
+    return c.json({
+      success,
+      provider,
+      model,
+      stdout,
+      stderr,
+    });
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    return c.json({ error: errorMessage }, 500);
+  }
 });
 
 // Mount admin API routes under /admin
