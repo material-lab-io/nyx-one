@@ -1,0 +1,37 @@
+[Unit]
+Description=Clawdbot Gateway (OpenClaw v2026.2.3)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/home/kanaba/.nvm/versions/node/v22.22.0/bin/openclaw gateway run --verbose
+Restart=always
+RestartSec=5
+KillMode=process
+Environment=HOME=/home/kanaba
+Environment="PATH=/home/kanaba/.nvm/versions/node/v22.22.0/bin:/home/kanaba/.local/bin:/usr/local/bin:/usr/bin:/bin"
+Environment=NODE_ENV=production
+Environment=CLAWDBOT_GATEWAY_PORT=18789
+Environment="CLAWDBOT_SYSTEMD_UNIT=clawdbot-gateway.service"
+Environment=CLAWDBOT_SERVICE_MARKER=clawdbot
+Environment=CLAWDBOT_SERVICE_KIND=gateway
+Environment=CLAWDBOT_SERVICE_VERSION=2026.2.3-1
+# Fix: Exclude Ollama from LD_LIBRARY_PATH to prevent node-llama-cpp crash
+Environment="LD_LIBRARY_PATH=/usr/local/cuda-12.1/lib64"
+Environment=GROQ_API_KEY=gsk_YOUR_GROQ_KEY
+Environment=ANTHROPIC_API_KEY=sk-ant-YOUR_ANTHROPIC_KEY
+Environment=ORPHEUS_TTS_URL=http://localhost:8787/tts
+Environment=VOICE_SILENCE_MS=1200
+Environment=VOICE_ECHO_ENABLED=true
+Environment=DISCORD_AUTO_JOIN_GUILD=1466170985597374496
+Environment=DISCORD_AUTO_JOIN_CHANNEL=1466170986658267439
+# Increase restart attempts
+StartLimitIntervalSec=300
+StartLimitBurst=10
+# Standard output/error to journal
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

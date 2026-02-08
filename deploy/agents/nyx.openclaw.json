@@ -1,0 +1,240 @@
+{
+  "meta": {
+    "lastTouchedVersion": "2026.2.3-1",
+    "lastTouchedAt": "2026-02-08T16:00:53.527Z"
+  },
+  "wizard": {
+    "lastRunAt": "2026-02-08T15:46:05.598Z",
+    "lastRunVersion": "2026.2.3-1",
+    "lastRunCommand": "configure",
+    "lastRunMode": "local"
+  },
+  "auth": {
+    "profiles": {
+      "anthropic:nyx": {
+        "provider": "anthropic",
+        "mode": "token"
+      }
+    }
+  },
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "anthropic/claude-sonnet-4-5-20250929"
+      },
+      "models": {
+        "anthropic/claude-opus-4-5": {
+          "alias": "opus"
+        }
+      },
+      "memorySearch": {
+        "enabled": false
+      },
+      "compaction": {
+        "mode": "safeguard"
+      },
+      "maxConcurrent": 4,
+      "subagents": {
+        "maxConcurrent": 8,
+        "model": {
+          "primary": "anthropic/claude-sonnet-4-5-20250929"
+        }
+      }
+    },
+    "list": [
+      {
+        "id": "nyx",
+        "default": true,
+        "name": "Nyx (Master)",
+        "identity": {
+          "name": "Nyx",
+          "emoji": "🌙"
+        },
+        "subagents": {
+          "allowAgents": [
+            "*",
+            "moldbook"
+          ],
+          "model": {
+            "primary": "anthropic/claude-sonnet-4-5-20250929"
+          }
+        },
+        "tools": {
+          "profile": "full",
+          "deny": [],
+          "exec": {
+            "host": "sandbox",
+            "security": "full"
+          }
+        }
+      },
+      {
+        "id": "moldbook",
+        "name": "Nyx-moldbook",
+        "workspace": "/home/kanaba/.clawdbot/workspaces/moldbook",
+        "identity": {
+          "name": "Nyx-moldbook",
+          "emoji": "📓"
+        },
+        "tools": {
+          "profile": "minimal",
+          "allow": [
+            "browser_*"
+          ],
+          "deny": [
+            "memory_*",
+            "sessions_*",
+            "agents_*"
+          ],
+          "exec": {
+            "host": "sandbox",
+            "security": "full"
+          }
+        }
+      }
+    ]
+  },
+  "tools": {
+    "media": {
+      "audio": {
+        "enabled": true,
+        "models": [
+          {
+            "provider": "groq",
+            "model": "whisper-large-v3-turbo"
+          }
+        ]
+      }
+    },
+    "subagents": {
+      "tools": {
+        "deny": [
+          "group:messaging",
+          "whatsapp_*",
+          "gmail_*",
+          "calendar_*",
+          "drive_*",
+          "sessions_spawn",
+          "gateway"
+        ]
+      }
+    }
+  },
+  "bindings": [
+    {
+      "agentId": "moldbook",
+      "match": {
+        "channel": "discord",
+        "peer": {
+          "kind": "channel",
+          "id": "1467149137618272511"
+        },
+        "guildId": "1466170985597374496"
+      }
+    },
+    {
+      "agentId": "nyx",
+      "match": {
+        "channel": "discord",
+        "peer": {
+          "kind": "channel",
+          "id": "1467150594627211456"
+        },
+        "guildId": "1466170985597374496"
+      }
+    }
+  ],
+  "messages": {
+    "ackReactionScope": "group-mentions"
+  },
+  "commands": {
+    "native": "auto",
+    "nativeSkills": "auto"
+  },
+  "channels": {
+    "whatsapp": {
+      "dmPolicy": "allowlist",
+      "allowFrom": [
+        "+917259620848",
+        "+919818452569"
+      ],
+      "groupPolicy": "open",
+      "mediaMaxMb": 50,
+      "groups": {
+        "120363423123267841@g.us": {
+          "requireMention": false
+        },
+        "120363404614075738@g.us": {
+          "requireMention": false
+        }
+      },
+      "debounceMs": 0
+    },
+    "discord": {
+      "enabled": true,
+      "token": "YOUR_DISCORD_BOT_TOKEN",
+      "groupPolicy": "allowlist",
+      "guilds": {
+        "1466170985597374496": {
+          "slug": "material-lab",
+          "channels": {
+            "moldbook": {
+              "allow": true,
+              "requireMention": false,
+              "systemPrompt": "You are Nyx-moldbook, the NotebookLM research assistant. Always identify yourself as Nyx-moldbook in your responses."
+            },
+            "nyx": {
+              "allow": true,
+              "requireMention": false
+            },
+            "general": {
+              "allow": true,
+              "requireMention": true
+            }
+          }
+        }
+      }
+    }
+  },
+  "gateway": {
+    "mode": "local",
+    "auth": {
+      "mode": "token",
+      "token": "nyx-gateway-local-token-2026"
+    },
+    "remote": {
+      "token": "clawdbot-gateway-token"
+    }
+  },
+  "skills": {
+    "load": {
+      "extraDirs": [
+        "/home/kanaba/clawdbot-skills"
+      ]
+    },
+    "entries": {
+      "memory-system": {
+        "enabled": true,
+        "env": {
+          "LINEAR_API_KEY": "lin_api_YOUR_LINEAR_KEY"
+        }
+      },
+      "notebooklm": {
+        "enabled": true
+      },
+      "dracula": {
+        "enabled": true
+      }
+    }
+  },
+  "plugins": {
+    "entries": {
+      "discord": {
+        "enabled": true
+      },
+      "whatsapp": {
+        "enabled": true
+      }
+    }
+  }
+}

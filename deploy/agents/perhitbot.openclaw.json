@@ -1,0 +1,155 @@
+{
+  "meta": {
+    "lastTouchedVersion": "2026.2.3",
+    "lastTouchedAt": "2026-02-08T05:42:00.000Z"
+  },
+  "wizard": {
+    "lastRunAt": "2026-02-08T00:00:00.000Z",
+    "lastRunVersion": "2026.2.3-1",
+    "lastRunCommand": "init",
+    "lastRunMode": "local"
+  },
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "anthropic/claude-sonnet-4-5-20250929"
+      },
+      "models": {
+        "anthropic/claude-opus-4-5-20250929": { "alias": "Opus" },
+        "anthropic/claude-sonnet-4-5-20250929": { "alias": "Sonnet" },
+        "groq/mixtral-8x7b-32768": { "alias": "Groq" }
+      },
+      "memorySearch": {
+        "enabled": false
+      },
+      "compaction": {
+        "mode": "safeguard"
+      },
+      "maxConcurrent": 4,
+      "subagents": {
+        "maxConcurrent": 8,
+        "model": {
+          "primary": "anthropic/claude-sonnet-4-5-20250929"
+        }
+      }
+    },
+    "list": [
+      {
+        "id": "perhitbot",
+        "default": true,
+        "name": "PerhitBot",
+        "identity": {
+          "name": "PerhitBot",
+          "emoji": "📦"
+        },
+        "subagents": {
+          "allowAgents": [
+            "*"
+          ],
+          "model": {
+            "primary": "anthropic/claude-sonnet-4-5-20250929"
+          }
+        },
+        "tools": {
+          "profile": "full",
+          "deny": [],
+          "allow": [
+            "browser_*"
+          ],
+          "exec": {
+            "host": "sandbox",
+            "security": "full"
+          }
+        }
+      }
+    ]
+  },
+  "tools": {
+    "media": {
+      "audio": {
+        "enabled": true,
+        "models": [
+          { "provider": "groq", "model": "whisper-large-v3-turbo" }
+        ]
+      }
+    },
+    "subagents": {
+      "tools": {
+        "deny": [
+          "group:messaging",
+          "whatsapp_*",
+          "gmail_*",
+          "calendar_*",
+          "drive_*",
+          "sessions_spawn",
+          "gateway"
+        ]
+      }
+    }
+  },
+  "bindings": [],
+  "messages": {
+    "ackReactionScope": "group-mentions"
+  },
+  "commands": {
+    "native": "auto",
+    "nativeSkills": "auto"
+  },
+  "session": {
+    "dmScope": "per-channel-peer"
+  },
+  "channels": {
+    "whatsapp": {
+      "dmPolicy": "allowlist",
+      "allowFrom": [
+        "+917259620848",
+        "+919818452569",
+        "+919642067763"
+      ],
+      "groupPolicy": "open",
+      "mediaMaxMb": 50,
+      "debounceMs": 0,
+      "groups": {
+        "120363423123267841@g.us": {
+          "requireMention": false
+        }
+      }
+    },
+    "discord": {
+      "enabled": false,
+      "token": "",
+      "groupPolicy": "allowlist"
+    }
+  },
+  "gateway": {
+    "mode": "local",
+    "auth": {
+      "mode": "token",
+      "token": "perhitbot-gateway-token-2026"
+    }
+  },
+  "skills": {
+    "load": {
+      "extraDirs": []
+    },
+    "entries": {}
+  },
+  "plugins": {
+    "entries": {
+      "whatsapp": {
+        "enabled": true
+      },
+      "discord": {
+        "enabled": false
+      }
+    }
+  },
+  "auth": {
+    "profiles": {
+      "anthropic:manual": {
+        "provider": "anthropic",
+        "mode": "token"
+      }
+    }
+  }
+}
