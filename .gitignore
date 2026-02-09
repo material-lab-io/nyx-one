@@ -58,3 +58,9 @@ test/e2e/.dev.vars
 
 # Temporary e2e wrangler configs
 .wrangler-e2e-*.jsonc
+
+# Gas Town (added by gt)
+.runtime/
+.claude/
+.logs/
+.beads/
