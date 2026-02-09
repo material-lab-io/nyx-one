@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "swiggy-food": {
+      "type": "http",
+      "url": "https://mcp.swiggy.com/food",
+      "auth": "oauth",
+      "oauthRedirectUrl": "http://127.0.0.1:38305/callback"
+    },
+    "swiggy-instamart": {
+      "type": "http",
+      "url": "https://mcp.swiggy.com/im",
+      "auth": "oauth",
+      "oauthRedirectUrl": "http://127.0.0.1:38305/callback"
+    }
+  },
+  "imports": []
+}

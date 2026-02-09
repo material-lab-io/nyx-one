@@ -296,6 +296,55 @@ if (process.env.WHATSAPP_ENABLED === 'true') {
     }
 }
 
+// ============================================================
+// SWIGGY MCP SERVER CONFIGURATION
+// ============================================================
+// Configure mcporter with Swiggy HTTP+OAuth MCP servers.
+// Phone-based access control: only phones matching SWIGGY_ALLOW_PHONES
+// (default: phones ending in 0848) can use swiggy/instamart skills.
+{
+    const mcporterConfigDir = '/root/.mcporter';
+    const mcporterConfigPath = mcporterConfigDir + '/mcporter.json';
+    const fs2 = require('fs');
+
+    let mcpConfig = {};
+    try {
+        mcpConfig = JSON.parse(fs2.readFileSync(mcporterConfigPath, 'utf8'));
+    } catch (e) {
+        // Start fresh
+    }
+
+    mcpConfig.mcpServers = mcpConfig.mcpServers || {};
+    mcpConfig.mcpServers['swiggy-food'] = {
+        type: 'http',
+        url: 'https://mcp.swiggy.com/food',
+        auth: 'oauth',
+        oauthRedirectUrl: 'http://127.0.0.1:38305/callback'
+    };
+    mcpConfig.mcpServers['swiggy-instamart'] = {
+        type: 'http',
+        url: 'https://mcp.swiggy.com/im',
+        auth: 'oauth',
+        oauthRedirectUrl: 'http://127.0.0.1:38305/callback'
+    };
+    mcpConfig.imports = mcpConfig.imports || [];
+
+    fs2.mkdirSync(mcporterConfigDir, { recursive: true });
+    fs2.writeFileSync(mcporterConfigPath, JSON.stringify(mcpConfig, null, 2));
+    console.log('Swiggy MCP servers configured in mcporter');
+}
+
+// Write SWIGGY_ALLOW_PHONES to a runtime file the agent can check.
+// Default: phones ending in 0848. Format: comma-separated suffixes or full numbers.
+{
+    const allowPhones = process.env.SWIGGY_ALLOW_PHONES || '*0848';
+    const runtimeDir = '/root/clawd';
+    const fs3 = require('fs');
+    fs3.mkdirSync(runtimeDir, { recursive: true });
+    fs3.writeFileSync(runtimeDir + '/.swiggy-allow-phones', allowPhones);
+    console.log('Swiggy phone ACL:', allowPhones);
+}
+
 // Base URL override (e.g., for Cloudflare AI Gateway)
 // Usage: Set AI_GATEWAY_BASE_URL or ANTHROPIC_BASE_URL to your endpoint like:
 //   https://gateway.ai.cloudflare.com/v1/{account_id}/{gateway_id}/anthropic
