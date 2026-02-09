@@ -200,7 +200,7 @@ export async function ensureMoltbotGateway(sandbox: Sandbox, env: MoltbotEnv): P
   try {
     // Source the env file before running the start script
     const fullCommand = Object.keys(envVars).length > 0
-      ? `bash -c '. /tmp/moltbot-env.sh 2>/dev/null; ${command}'`
+      ? `bash -c '. /tmp/moltbot-env.sh; ${command}'`
       : command;
 
     process = await sandbox.startProcess(fullCommand);
@@ -234,6 +234,15 @@ export async function ensureMoltbotGateway(sandbox: Sandbox, env: MoltbotEnv): P
 
   // Verify gateway is actually responding
   console.log('[Gateway] Verifying gateway health...');
-  
+  try {
+    const healthResp = await sandbox.containerFetch(
+      new Request(`http://localhost:${MOLTBOT_PORT}/health`),
+      MOLTBOT_PORT
+    );
+    console.log('[Gateway] Health check status:', healthResp.status);
+  } catch (healthErr) {
+    console.log('[Gateway] Health check failed (non-fatal):', healthErr);
+  }
+
   return process;
 }

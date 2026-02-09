@@ -89,8 +89,8 @@ export async function mountR2Storage(sandbox: Sandbox, env: MoltbotEnv): Promise
  * @returns true if secrets were written successfully
  */
 export async function writeSecretsToR2(env: MoltbotEnv): Promise<boolean> {
-  if (!env.R2_STORAGE) {
-    console.log('[R2] No R2_STORAGE binding, cannot write secrets');
+  if (!env.MOLTBOT_BUCKET) {
+    console.log('[R2] No MOLTBOT_BUCKET binding, cannot write secrets');
     return false;
   }
 
@@ -110,7 +110,7 @@ export async function writeSecretsToR2(env: MoltbotEnv): Promise<boolean> {
 
   try {
     // Write to R2 bucket at secrets.env path
-    await env.R2_STORAGE.put('secrets.env', content, {
+    await env.MOLTBOT_BUCKET.put('secrets.env', content, {
       httpMetadata: { contentType: 'text/plain' },
     });
     console.log(`[R2] Wrote ${Object.keys(envVars).length} secrets to R2 (secrets.env)`);

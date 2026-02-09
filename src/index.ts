@@ -358,8 +358,9 @@ app.all('*', async (c) => {
       }
       if (containerWs.readyState === WebSocket.OPEN) {
         containerWs.send(data);
-      } else if (debugLogs) {
-        console.log('[WS] Container not open, readyState:', containerWs.readyState);
+      } else {
+        console.warn('[WS] Container not ready (readyState:', containerWs.readyState, '), closing client');
+        serverWs.close(1013, 'Container not ready, try again');
       }
     });
 

@@ -123,6 +123,18 @@ describe('extractJWT', () => {
     const c = createMockContext({ cookies: `  CF_Authorization=${jwt}  ` });
     expect(extractJWT(c)).toBe(jwt);
   });
+
+  it('handles JWT with = in base64 padding', () => {
+    const jwt = 'header.payload.sig==';
+    const c = createMockContext({ cookies: `CF_Authorization=${jwt}` });
+    expect(extractJWT(c)).toBe(jwt);
+  });
+
+  it('handles JWT with multiple = segments', () => {
+    const jwt = 'eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzI1NiJ9.eyJpc3MiOiJ0ZXN0In0=.c2lnbmF0dXJl';
+    const c = createMockContext({ cookies: `CF_Authorization=${jwt}` });
+    expect(extractJWT(c)).toBe(jwt);
+  });
 });
 
 describe('createAccessMiddleware', () => {
@@ -191,32 +203,26 @@ describe('createAccessMiddleware', () => {
     expect(setMock).toHaveBeenCalledWith('accessUser', { email: 'dev@localhost', name: 'Dev User' });
   });
 
-  it('returns 500 JSON error when CF Access not configured', async () => {
-    const { c, jsonMock } = createFullMockContext({ env: {} });
+  it('skips auth and sets admin user when CF Access not configured', async () => {
+    const { c, setMock } = createFullMockContext({ env: {} });
     const middleware = createAccessMiddleware({ type: 'json' });
     const next = vi.fn();
 
     await middleware(c, next);
 
-    expect(next).not.toHaveBeenCalled();
-    expect(jsonMock).toHaveBeenCalledWith(
-      expect.objectContaining({ error: 'Cloudflare Access not configured' }),
-      500
-    );
+    expect(next).toHaveBeenCalled();
+    expect(setMock).toHaveBeenCalledWith('accessUser', { email: 'admin@localhost', name: 'Admin' });
   });
 
-  it('returns 500 HTML error when CF Access not configured', async () => {
-    const { c, htmlMock } = createFullMockContext({ env: {} });
+  it('skips auth and sets admin user when CF Access not configured (html)', async () => {
+    const { c, setMock } = createFullMockContext({ env: {} });
     const middleware = createAccessMiddleware({ type: 'html' });
     const next = vi.fn();
 
     await middleware(c, next);
 
-    expect(next).not.toHaveBeenCalled();
-    expect(htmlMock).toHaveBeenCalledWith(
-      expect.stringContaining('Admin UI Not Configured'),
-      500
-    );
+    expect(next).toHaveBeenCalled();
+    expect(setMock).toHaveBeenCalledWith('accessUser', { email: 'admin@localhost', name: 'Admin' });
   });
 
   it('returns 401 JSON error when JWT is missing', async () => {

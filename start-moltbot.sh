@@ -279,6 +279,21 @@ if (process.env.WHATSAPP_ENABLED === 'true') {
     } else if (whatsappDmPolicy === 'open') {
         config.channels.whatsapp.allowFrom = ['*'];
     }
+
+    // Group policy: 'open', 'allowlist', or 'deny'
+    const whatsappGroupPolicy = process.env.WHATSAPP_GROUP_POLICY || 'open';
+    config.channels.whatsapp.groupPolicy = whatsappGroupPolicy;
+    console.log('WhatsApp groupPolicy:', whatsappGroupPolicy);
+
+    // Group-specific settings (JSON-encoded)
+    if (process.env.WHATSAPP_GROUPS) {
+        try {
+            config.channels.whatsapp.groups = JSON.parse(process.env.WHATSAPP_GROUPS);
+            console.log('WhatsApp groups config loaded');
+        } catch (e) {
+            console.log('Warning: Could not parse WHATSAPP_GROUPS:', e.message);
+        }
+    }
 }
 
 // Base URL override (e.g., for Cloudflare AI Gateway)
@@ -395,13 +410,40 @@ const fs = require('fs');
 const configPath = '/root/.clawdbot/clawdbot.json';
 try {
     const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+    let changed = false;
+
     if (config.channels?.discord) {
         const oldPolicy = config.channels.discord.groupPolicy;
         config.channels.discord.groupPolicy = 'open';
-        fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
         if (oldPolicy !== 'open') {
-            console.log('Forced Discord groupPolicy: allowlist -> open');
+            console.log('Forced Discord groupPolicy:', oldPolicy, '-> open');
+            changed = true;
         }
+    }
+
+    // Also force WhatsApp groupPolicy after doctor
+    if (config.channels?.whatsapp) {
+        const oldWaPolicy = config.channels.whatsapp.groupPolicy;
+        const targetWaPolicy = process.env.WHATSAPP_GROUP_POLICY || 'open';
+        config.channels.whatsapp.groupPolicy = targetWaPolicy;
+        if (oldWaPolicy !== targetWaPolicy) {
+            console.log('Forced WhatsApp groupPolicy:', oldWaPolicy, '->', targetWaPolicy);
+            changed = true;
+        }
+
+        // Re-apply group-specific settings that doctor may have cleared
+        if (process.env.WHATSAPP_GROUPS) {
+            try {
+                config.channels.whatsapp.groups = JSON.parse(process.env.WHATSAPP_GROUPS);
+                changed = true;
+            } catch (e) {
+                // Already warned during initial config
+            }
+        }
+    }
+
+    if (changed) {
+        fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
     }
 } catch (e) {
     console.log('Note: Could not update groupPolicy:', e.message);

@@ -34,7 +34,7 @@ export function extractJWT(c: Context<AppEnv>): string | null {
   const jwtCookie = c.req.raw.headers.get('Cookie')
     ?.split(';')
     .find(cookie => cookie.trim().startsWith('CF_Authorization='))
-    ?.split('=')[1];
+    ?.split('=').slice(1).join('=');
 
   return jwtHeader || jwtCookie || null;
 }
