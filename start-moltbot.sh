@@ -305,11 +305,10 @@ if (process.env.WHATSAPP_ENABLED === 'true') {
 {
     const mcporterConfigDir = '/root/.mcporter';
     const mcporterConfigPath = mcporterConfigDir + '/mcporter.json';
-    const fs2 = require('fs');
 
     let mcpConfig = {};
     try {
-        mcpConfig = JSON.parse(fs2.readFileSync(mcporterConfigPath, 'utf8'));
+        mcpConfig = JSON.parse(fs.readFileSync(mcporterConfigPath, 'utf8'));
     } catch (e) {
         // Start fresh
     }
@@ -329,8 +328,8 @@ if (process.env.WHATSAPP_ENABLED === 'true') {
     };
     mcpConfig.imports = mcpConfig.imports || [];
 
-    fs2.mkdirSync(mcporterConfigDir, { recursive: true });
-    fs2.writeFileSync(mcporterConfigPath, JSON.stringify(mcpConfig, null, 2));
+    fs.mkdirSync(mcporterConfigDir, { recursive: true });
+    fs.writeFileSync(mcporterConfigPath, JSON.stringify(mcpConfig, null, 2));
     console.log('Swiggy MCP servers configured in mcporter');
 }
 
@@ -339,9 +338,8 @@ if (process.env.WHATSAPP_ENABLED === 'true') {
 {
     const allowPhones = process.env.SWIGGY_ALLOW_PHONES || '*0848';
     const runtimeDir = '/root/clawd';
-    const fs3 = require('fs');
-    fs3.mkdirSync(runtimeDir, { recursive: true });
-    fs3.writeFileSync(runtimeDir + '/.swiggy-allow-phones', allowPhones);
+    fs.mkdirSync(runtimeDir, { recursive: true });
+    fs.writeFileSync(runtimeDir + '/.swiggy-allow-phones', allowPhones);
     console.log('Swiggy phone ACL:', allowPhones);
 }
 
