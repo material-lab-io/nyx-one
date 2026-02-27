@@ -8,7 +8,7 @@ const { execFile } = require('child_process');
 
 const PORT = parseInt(process.env.MAYOR_BRIDGE_PORT || '19000', 10);
 const TOKEN = process.env.MAYOR_BRIDGE_TOKEN;
-const ALLOWED_FROM = ['nyx', 'princess'];
+const ALLOWED_FROM = ['nyx', 'princess', 'sailor', 'gymbo', 'perhit'];
 const GT_DIR = process.env.GT_DIR || '/home/kanaba/gt';
 
 if (!TOKEN) { console.error('MAYOR_BRIDGE_TOKEN not set'); process.exit(1); }
@@ -34,13 +34,14 @@ http.createServer((req, res) => {
       return;
     }
 
-    const { from, subject, body: text } = msg;
+    const { from, subject, body: text, to } = msg;
     if (!ALLOWED_FROM.includes(from) || !subject || !text) {
       res.writeHead(400).end('Invalid fields');
       return;
     }
 
-    const child = execFile('gt', ['mail', 'send', 'mayor/', '-s', `${from}:${subject}`, '--stdin'], {
+    const dest = to ? ` [→${to}]` : '';
+    const child = execFile('gt', ['mail', 'send', 'mayor/', '-s', `${from}:${subject}${dest}`, '--stdin'], {
       cwd: GT_DIR,
       env: { ...process.env, HOME: '/home/kanaba' }
     });
@@ -51,7 +52,7 @@ http.createServer((req, res) => {
     child.on('close', code => {
       if (code === 0) {
         res.writeHead(200).end('ok');
-        console.log(`[mayor-bridge] ${from}:${subject} → sent`);
+        console.log(`[mayor-bridge] ${from}:${subject}${dest} → sent`);
       } else {
         res.writeHead(500).end('gt mail failed');
         console.error(`[mayor-bridge] gt mail exited ${code}`);

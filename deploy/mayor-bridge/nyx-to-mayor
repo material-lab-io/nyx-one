@@ -2,21 +2,53 @@
 # nyx-to-mayor — Send a message from Nyx to Mayor
 # In container: uses mayor-bridge HTTP adapter (MAYOR_BRIDGE_URL set)
 # On host:      calls gt mail send directly
+#
+# Usage:
+#   nyx-to-mayor "subject" "body"
+#   nyx-to-mayor "subject" "body" --to "sailor/sailor"
 
 set -euo pipefail
 
-SUBJECT="${1:?Usage: nyx-to-mayor \"subject\" \"body\"}"
-BODY="${2:?Usage: nyx-to-mayor \"subject\" \"body\"}"
+SUBJECT="${1:?Usage: nyx-to-mayor \"subject\" \"body\" [--to address]}"
+BODY="${2:?Usage: nyx-to-mayor \"subject\" \"body\" [--to address]}"
 FROM="${BRIDGE_FROM:-nyx}"
+TO_ADDR=""
+
+# Parse optional --to argument
+shift 2
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --to)
+      TO_ADDR="${2:?--to requires an address argument}"
+      shift 2
+      ;;
+    *)
+      echo "Unknown argument: $1" >&2
+      exit 1
+      ;;
+  esac
+done
+
+# Inject structured header so Mayor always has context
+ROUTE_HINT="${TO_ADDR:-Mayor to decide}"
+STRUCTURED_BODY="NEEDS: ${SUBJECT}
+SUGGESTED ROUTE: ${ROUTE_HINT}
+---
+${BODY}"
 
 if [ -n "${MAYOR_BRIDGE_URL:-}" ]; then
   # Container mode: POST to mayor-bridge via node (no curl/wget in image)
-  FROM="$FROM" SUBJECT="$SUBJECT" BODY="$BODY" \
+  FROM="$FROM" SUBJECT="$SUBJECT" BODY="$STRUCTURED_BODY" TO_ADDR="$TO_ADDR" \
   MAYOR_BRIDGE_TOKEN="${MAYOR_BRIDGE_TOKEN:?MAYOR_BRIDGE_TOKEN not set}" \
   node -e "
 const http = require('${MAYOR_BRIDGE_URL}'.startsWith('https') ? 'https' : 'http');
 const url = new URL('${MAYOR_BRIDGE_URL}/mail'.replace(/'/g, ''));
-const payload = JSON.stringify({ from: process.env.FROM, subject: process.env.SUBJECT, body: process.env.BODY });
+const payload = JSON.stringify({
+  from: process.env.FROM,
+  subject: process.env.SUBJECT,
+  body: process.env.BODY,
+  ...(process.env.TO_ADDR ? { to: process.env.TO_ADDR } : {})
+});
 const opts = {
   hostname: url.hostname,
   port: url.port || (url.protocol === 'https:' ? 443 : 80),
@@ -47,7 +79,7 @@ req.end();
 else
   # Host mode: call gt mail directly
   cd /home/kanaba/gt
-  exec gt mail send mayor/ -s "${FROM}:${SUBJECT}" --stdin <<BODY_END
-${BODY}
+  exec gt mail send mayor/ -s "${FROM}:${SUBJECT}${TO_ADDR:+ [→${TO_ADDR}]}" --stdin <<BODY_END
+${STRUCTURED_BODY}
 BODY_END
 fi
