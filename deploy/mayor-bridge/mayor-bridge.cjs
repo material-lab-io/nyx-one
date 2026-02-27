@@ -58,6 +58,6 @@ http.createServer((req, res) => {
       }
     });
   });
-}).listen(PORT, '127.0.0.1', () => {
-  console.log(`mayor-bridge listening on 127.0.0.1:${PORT}`);
+}).listen(PORT, '0.0.0.0', () => {
+  console.log(`mayor-bridge listening on 0.0.0.0:${PORT}`);
 });
