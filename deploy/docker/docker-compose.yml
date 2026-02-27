@@ -50,18 +50,19 @@ services:
   #   ports:
   #     - "18790:18789"
 
-  test-tenant:
+  nyx:
     image: openclaw:2026.2.3
-    container_name: openclaw-test-tenant
+    container_name: openclaw-nyx
     restart: always
     # Use host network for simpler port binding
     network_mode: host
     env_file:
-      - /data/test-tenant/secrets.env
+      - /data/nyx/secrets.env
     environment:
       - OPENCLAW_GATEWAY_PORT=18789
     volumes:
-      - /data/test-tenant/.openclaw:/root/.openclaw
+      - /data/nyx/.openclaw:/root/.openclaw
+      - /home/kanaba/gt/nyx_one/mayor/rig/deploy/mayor-bridge/nyx-to-mayor:/usr/local/bin/nyx-to-mayor:ro
     # Enable tty for interactive OAuth login
     tty: true
     stdin_open: true

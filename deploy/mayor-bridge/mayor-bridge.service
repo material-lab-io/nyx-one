@@ -1,0 +1,14 @@
+[Unit]
+Description=Mayor Mail Bridge (container → gt mail)
+After=network.target
+
+[Service]
+Type=simple
+User=kanaba
+EnvironmentFile=/data/mayor-bridge/secrets.env
+ExecStart=/usr/bin/node /home/kanaba/gt/nyx_one/mayor/rig/deploy/mayor-bridge/mayor-bridge.cjs
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

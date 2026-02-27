@@ -1,0 +1,28 @@
+#!/bin/bash
+# nyx-to-mayor — Send a message from Nyx to Mayor
+# In container: uses mayor-bridge HTTP adapter (MAYOR_BRIDGE_URL set)
+# On host:      calls gt mail send directly
+
+set -euo pipefail
+
+SUBJECT="${1:?Usage: nyx-to-mayor \"subject\" \"body\"}"
+BODY="${2:?Usage: nyx-to-mayor \"subject\" \"body\"}"
+FROM="${BRIDGE_FROM:-nyx}"
+
+if [ -n "${MAYOR_BRIDGE_URL:-}" ]; then
+  # Container mode: POST to mayor-bridge
+  PAYLOAD=$(printf '{"from":"%s","subject":"%s","body":"%s"}' \
+    "$FROM" \
+    "$(printf '%s' "$SUBJECT" | sed 's/"/\\"/g')" \
+    "$(printf '%s' "$BODY" | sed 's/"/\\"/g; s/$/\\n/' | tr -d '\n')")
+  curl -sf -X POST "${MAYOR_BRIDGE_URL}/mail" \
+    -H "Authorization: Bearer ${MAYOR_BRIDGE_TOKEN:?MAYOR_BRIDGE_TOKEN not set}" \
+    -H "Content-Type: application/json" \
+    -d "$PAYLOAD"
+else
+  # Host mode: call gt mail directly
+  cd /home/kanaba/gt
+  exec gt mail send mayor/ -s "${FROM}:${SUBJECT}" --stdin <<BODY_END
+${BODY}
+BODY_END
+fi
