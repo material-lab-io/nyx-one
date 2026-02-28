@@ -27,6 +27,7 @@
           "alias": "opus"
         }
       },
+      "thinkingDefault": "off",
       "memorySearch": {
         "enabled": false
       },
