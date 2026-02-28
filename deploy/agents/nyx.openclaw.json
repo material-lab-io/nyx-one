@@ -14,6 +14,10 @@
       "anthropic:nyx": {
         "provider": "anthropic",
         "mode": "token"
+      },
+      "groq:nyx": {
+        "provider": "groq",
+        "mode": "token"
       }
     }
   },
