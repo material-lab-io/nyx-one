@@ -1,0 +1,18 @@
+[Unit]
+Description=Nyx WhatsApp Bridge - %i
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/gt/nyx_one/crew/%i
+EnvironmentFile=%h/gt/nyx_one/accounts/%i.env
+ExecStart=/usr/bin/node %h/gt/nyx_one/crew/nyx/deploy/baileys/baileys-bridge.js
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=35
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=nyx-bridge-%i
+
+[Install]
+WantedBy=default.target

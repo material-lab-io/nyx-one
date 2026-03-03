@@ -31,6 +31,10 @@ Thumbs.db
 .env.*
 !.env.example
 
+# Per-account secrets (committed as .env.example, never as .env)
+accounts/*.env
+!accounts/*.env.example
+
 # TypeScript
 *.tsbuildinfo
 

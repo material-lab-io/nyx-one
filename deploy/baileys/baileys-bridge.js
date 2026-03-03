@@ -1,54 +1,107 @@
 #!/usr/bin/env node
 'use strict';
 /**
- * nyx-baileys-bridge — Standalone WhatsApp ↔ Claude Code CLI bridge
+ * baileys-bridge — Generalized WhatsApp ↔ Claude Code CLI bridge
  *
  * Flow: WhatsApp message → ACL check → conversation history → claude -p → reply
  *
  * Environment variables:
- *   NYX_DATA_DIR          Persistent data dir (credentials + history). Default: /data/nyx
- *   NYX_CLAUDE_WORKDIR    Working dir for claude CLI invocations. Default: /app
- *   NYX_CLAUDE_BIN        Path to claude binary. Default: claude
- *   MAYOR_BRIDGE_URL      If set, enables nyx-to-mayor calls (optional)
- *   MAYOR_BRIDGE_TOKEN    Token for mayor bridge auth (optional)
- *   NYX_WA_DM_ALLOWLIST   Comma-separated phone numbers allowed in DM. Default: from config
- *   NYX_WA_GROUP_POLICY   open|allowlist|deny. Default: open
- *   NYX_WA_GROUPS         JSON: { "groupJid": { requireMention: bool } }
- *   NYX_MAX_HISTORY       Max conversation turns to keep in context. Default: 20
+ *   BRIDGE_DATA_DIR         Persistent data dir (creds + history). Default: /data/nyx
+ *   BRIDGE_CLAUDE_WORKDIR   Working dir for claude CLI. Default: /app
+ *   BRIDGE_CLAUDE_BIN       Path to claude binary. Default: claude
+ *   AGENT_NAME              Agent identifier for logs/alerts. Default: nyx
+ *   AGENT_DISPLAY_NAME      Display name used in history. Default: AGENT_NAME
+ *   MAYOR_BRIDGE_URL        If set, enables nyx-to-mayor calls (optional)
+ *   MAYOR_BRIDGE_TOKEN      Token for mayor bridge auth (optional)
+ *   BRIDGE_WA_DM_ALLOWLIST  Comma-separated phone numbers allowed in DM
+ *   BRIDGE_WA_GROUP_POLICY  open|allowlist|deny. Default: open
+ *   BRIDGE_WA_GROUPS        JSON: { "groupJid": { requireMention: bool } }
+ *   BRIDGE_MAX_HISTORY      Max conversation turns to keep. Default: 20
+ *   BRIDGE_HEALTH_PORT      HTTP health server port. Default: 8080
+ *
+ * NYX_* env vars are accepted as fallbacks for backwards compatibility.
  */
 
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, isJidGroup } = require('@whiskeysockets/baileys');
-const { Boom } = require('@hapi/boom');
 const { execFile, spawn } = require('child_process');
 const fs = require('fs');
+const http = require('http');
 const path = require('path');
 const pino = require('pino');
 
 // ── Config ────────────────────────────────────────────────────────────────────
-const DATA_DIR      = process.env.NYX_DATA_DIR      || '/data/nyx';
-const WORKDIR       = process.env.NYX_CLAUDE_WORKDIR || '/app';
-const CLAUDE_BIN    = process.env.NYX_CLAUDE_BIN     || 'claude';
-const MAX_HISTORY   = parseInt(process.env.NYX_MAX_HISTORY || '20', 10);
+const DATA_DIR     = process.env.BRIDGE_DATA_DIR       || process.env.NYX_DATA_DIR      || '/data/nyx';
+const WORKDIR      = process.env.BRIDGE_CLAUDE_WORKDIR || process.env.NYX_CLAUDE_WORKDIR || '/app';
+const CLAUDE_BIN   = process.env.BRIDGE_CLAUDE_BIN     || process.env.NYX_CLAUDE_BIN     || 'claude';
+const MAX_HISTORY  = parseInt(process.env.BRIDGE_MAX_HISTORY || process.env.NYX_MAX_HISTORY || '20', 10);
+const HEALTH_PORT  = parseInt(process.env.BRIDGE_HEALTH_PORT || '8080', 10);
+const AGENT_NAME   = process.env.AGENT_NAME         || 'nyx';
+const DISPLAY_NAME = process.env.AGENT_DISPLAY_NAME || AGENT_NAME;
 
-const DM_ALLOWLIST  = (process.env.NYX_WA_DM_ALLOWLIST || '+917259620848,+919818452569')
+const DM_ALLOWLIST = (process.env.BRIDGE_WA_DM_ALLOWLIST || process.env.NYX_WA_DM_ALLOWLIST || '+917259620848,+919818452569')
   .split(',').map(s => s.trim()).filter(Boolean);
-const GROUP_POLICY  = process.env.NYX_WA_GROUP_POLICY || 'open';
-let   GROUPS_CONFIG = {};
-try { GROUPS_CONFIG = JSON.parse(process.env.NYX_WA_GROUPS || '{}'); } catch {}
+const GROUP_POLICY = process.env.BRIDGE_WA_GROUP_POLICY || process.env.NYX_WA_GROUP_POLICY || 'open';
+let GROUPS_CONFIG = {};
+try { GROUPS_CONFIG = JSON.parse(process.env.BRIDGE_WA_GROUPS || process.env.NYX_WA_GROUPS || '{}'); } catch {}
 
-const CREDS_DIR     = path.join(DATA_DIR, 'creds');
-const HISTORY_DIR   = path.join(DATA_DIR, 'conversations');
+const CREDS_DIR   = path.join(DATA_DIR, 'creds');
+const HISTORY_DIR = path.join(DATA_DIR, 'conversations');
 
 // ── Logger ────────────────────────────────────────────────────────────────────
 const logger = pino({ level: process.env.LOG_LEVEL || 'info' });
 
-// ── System prompt (nyx identity) ─────────────────────────────────────────────
-const SYSTEM_PROMPT = `You are Nyx (🌙), Kanaba's personal AI assistant on WhatsApp.
-Be helpful, concise, and natural. You are running as a Claude Code agent.
-You have access to bash tools and can run commands when useful.
-Keep responses focused — WhatsApp is a chat medium, not a document editor.
-If you need to send a message to the Gas Town mayor (Kanaba's AI task system),
-you can run the command: nyx-to-mayor "subject" "body"`;
+// ── Shutdown / connection state ───────────────────────────────────────────────
+let shuttingDown = false;
+let waConnected  = false;
+
+// ── Per-chat message queue ────────────────────────────────────────────────────
+const chatQueues = new Map();
+const inFlight   = new Set();
+
+function enqueueForChat(chatId, thunk) {
+  const prev = chatQueues.get(chatId) || Promise.resolve();
+  const next = prev.then(thunk).catch(err => logger.error({ err, chatId }, 'Queue error'));
+  chatQueues.set(chatId, next);
+  inFlight.add(next);
+  next.finally(() => {
+    inFlight.delete(next);
+    if (chatQueues.get(chatId) === next) chatQueues.delete(chatId);
+  });
+  return next;
+}
+
+// ── SIGTERM handler (25s drain) ───────────────────────────────────────────────
+process.on('SIGTERM', async () => {
+  logger.info('SIGTERM received — draining in-flight requests (up to 25s)');
+  shuttingDown = true;
+  await Promise.race([
+    Promise.all([...inFlight]),
+    new Promise(r => setTimeout(r, 25000)),
+  ]);
+  logger.info('Drain complete — exiting');
+  process.exit(0);
+});
+
+// ── Auth error detection + mayor alert ───────────────────────────────────────
+const AUTH_PATTERNS = [/401/, /unauthorized/i, /oauth/i, /invalid.*token/i, /CLAUDE_CODE_OAUTH_TOKEN/];
+
+async function handleClaudeError(err) {
+  const msg = err.message + (err.stderr || '');
+  if (AUTH_PATTERNS.some(p => p.test(msg))) {
+    execFile('nyx-to-mayor', [
+      `${AGENT_NAME}: claude auth failure`,
+      `Token expired. Run: claude setup-token and update k8s secret.`,
+    ], { timeout: 10000 }, () => {});
+    return `⚠️ My AI connection is down. Kanaba has been notified.`;
+  }
+  return `⚠️ Sorry, ran into an error. Please try again.`;
+}
+
+// ── HTTP health server on :8080 ───────────────────────────────────────────────
+const healthServer = http.createServer((req, res) => {
+  const ok = waConnected && !shuttingDown;
+  res.writeHead(ok ? 200 : 503).end(JSON.stringify({ status: ok ? 'ok' : 'not-ready' }));
+});
 
 // ── ACL ───────────────────────────────────────────────────────────────────────
 function isAllowedDM(jid) {
@@ -60,19 +113,17 @@ function isAllowedDM(jid) {
 function isAllowedGroup(jid) {
   if (GROUP_POLICY === 'open') return true;
   if (GROUP_POLICY === 'deny') return false;
-  // allowlist
   return jid in GROUPS_CONFIG;
 }
 
-function requiresMention(jid, botJid) {
+function requiresMention(jid) {
   const cfg = GROUPS_CONFIG[jid];
   if (cfg && cfg.requireMention === false) return false;
-  return true; // default: require mention in groups
+  return true;
 }
 
 // ── Conversation history ──────────────────────────────────────────────────────
 function historyPath(chatId) {
-  // Sanitize chatId for use as filename
   const safe = chatId.replace(/[^a-zA-Z0-9+@._-]/g, '_');
   return path.join(HISTORY_DIR, `${safe}.jsonl`);
 }
@@ -98,32 +149,20 @@ function appendHistory(chatId, role, content) {
 function buildPrompt(chatId, newMessage, senderName) {
   const history = loadHistory(chatId);
   const lines = [];
-
   for (const h of history) {
-    if (h.role === 'user') {
-      lines.push(`User: ${h.content}`);
-    } else {
-      lines.push(`Nyx: ${h.content}`);
-    }
+    lines.push(h.role === 'user' ? `User: ${h.content}` : `${DISPLAY_NAME}: ${h.content}`);
   }
   lines.push(`User (${senderName}): ${newMessage}`);
-
   return lines.join('\n');
 }
 
 // ── Invoke Claude CLI ─────────────────────────────────────────────────────────
 function invokeClaude(prompt) {
   return new Promise((resolve, reject) => {
-    const args = [
-      '-p', prompt,
-      '--system', SYSTEM_PROMPT,
-      '--no-markdown',
-    ];
-
-    const child = spawn(CLAUDE_BIN, args, {
+    const child = spawn(CLAUDE_BIN, ['-p', prompt, '--no-markdown'], {
       cwd: WORKDIR,
       env: { ...process.env },
-      timeout: 120000, // 2 min timeout
+      timeout: 120000,
     });
 
     let stdout = '';
@@ -136,7 +175,9 @@ function invokeClaude(prompt) {
       if (code === 0) {
         resolve(stdout.trim());
       } else {
-        reject(new Error(`claude exited ${code}: ${stderr.slice(0, 500)}`));
+        const err = new Error(`claude exited ${code}: ${stderr.slice(0, 500)}`);
+        err.stderr = stderr;
+        reject(err);
       }
     });
 
@@ -144,32 +185,26 @@ function invokeClaude(prompt) {
   });
 }
 
-// ── Message handler ───────────────────────────────────────────────────────────
-async function handleMessage(sock, msg) {
-  const jid  = msg.key.remoteJid;
-  const self = msg.key.fromMe;
-  if (self) return; // ignore own messages
+// ── Process one message (serialized per chatId) ───────────────────────────────
+async function processMessage(sock, msg) {
+  const jid     = msg.key.remoteJid;
+  const isGroup = isJidGroup(jid);
+  const botJid  = sock.user?.id || '';
 
-  // Extract text
   const text = msg.message?.conversation
     || msg.message?.extendedTextMessage?.text
     || msg.message?.imageMessage?.caption
     || msg.message?.videoMessage?.caption
     || '';
 
-  if (!text.trim()) return; // ignore non-text for now
-
-  const isGroup = isJidGroup(jid);
-  const botJid  = sock.user?.id || '';
+  if (!text.trim()) return;
 
   // ACL checks
   if (isGroup) {
     if (!isAllowedGroup(jid)) return;
-    // Check requireMention
-    if (requiresMention(jid, botJid)) {
+    if (requiresMention(jid)) {
       const botNumber = botJid.replace(/:.*@/, '@');
       if (!text.includes('@' + botNumber.replace('@s.whatsapp.net', ''))) {
-        // Also check if mentioned by @tag
         const mentioned = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid || [];
         if (!mentioned.includes(botJid) && !mentioned.includes(botJid.replace(/:.*@/, '@'))) {
           return;
@@ -183,37 +218,52 @@ async function handleMessage(sock, msg) {
     }
   }
 
-  // Sender name
-  const senderJid = msg.key.participant || jid;
+  const senderJid  = msg.key.participant || jid;
   const senderName = msg.pushName || senderJid.replace(/@.*$/, '');
 
   logger.info({ jid, sender: senderName, isGroup }, 'Received message: %s', text.slice(0, 80));
 
-  // Send typing indicator
   await sock.sendPresenceUpdate('composing', jid);
-
-  // Store incoming message
   appendHistory(jid, 'user', `${senderName}: ${text}`);
 
-  // Build prompt and call claude
   const prompt = buildPrompt(jid, text, senderName);
 
   let reply;
+  const claudePromise = invokeClaude(prompt);
+  inFlight.add(claudePromise);
   try {
-    reply = await invokeClaude(prompt);
+    reply = await claudePromise;
   } catch (err) {
     logger.error({ err }, 'Claude invocation failed');
-    reply = '⚠️ Sorry, I ran into an error. Please try again.';
+    const errMsg = err.message + (err.stderr || '');
+    if (!AUTH_PATTERNS.some(p => p.test(errMsg))) {
+      // One auto-retry for transient errors
+      logger.info('Retrying after 2s...');
+      await new Promise(r => setTimeout(r, 2000));
+      try {
+        reply = await invokeClaude(prompt);
+      } catch (retryErr) {
+        logger.error({ err: retryErr }, 'Retry also failed');
+        reply = await handleClaudeError(retryErr);
+      }
+    } else {
+      reply = await handleClaudeError(err);
+    }
+  } finally {
+    inFlight.delete(claudePromise);
   }
 
-  // Store response
   appendHistory(jid, 'assistant', reply);
-
-  // Clear typing, send reply
   await sock.sendPresenceUpdate('paused', jid);
   await sock.sendMessage(jid, { text: reply }, { quoted: msg });
-
   logger.info({ jid, replyLen: reply.length }, 'Replied');
+}
+
+// ── Message handler (gate + enqueue) ─────────────────────────────────────────
+function handleMessage(sock, msg) {
+  if (shuttingDown) return;
+  if (msg.key.fromMe) return;
+  enqueueForChat(msg.key.remoteJid, () => processMessage(sock, msg));
 }
 
 // ── WhatsApp socket setup ─────────────────────────────────────────────────────
@@ -225,7 +275,7 @@ async function startBridge() {
 
   const sock = makeWASocket({
     auth: state,
-    logger: pino({ level: 'warn' }), // suppress Baileys internal noise
+    logger: pino({ level: 'warn' }),
     printQRInTerminal: true,
     markOnlineOnConnect: false,
   });
@@ -237,28 +287,30 @@ async function startBridge() {
       logger.info('QR code generated — scan with charlie account');
     }
     if (connection === 'close') {
-      const code = lastDisconnect?.error?.output?.statusCode;
+      waConnected = false;
+      const code      = lastDisconnect?.error?.output?.statusCode;
       const loggedOut = code === DisconnectReason.loggedOut;
       logger.info({ code, loggedOut }, 'Connection closed');
-      if (!loggedOut) {
+      if (!loggedOut && !shuttingDown) {
         logger.info('Reconnecting in 5s...');
         setTimeout(startBridge, 5000);
-      } else {
+      } else if (loggedOut) {
         logger.error('Logged out — delete creds and restart to re-link');
         process.exit(1);
       }
     } else if (connection === 'open') {
+      waConnected = true;
       logger.info({ jid: sock.user?.id }, 'WhatsApp connected');
     }
   });
 
-  sock.ev.on('messages.upsert', async ({ messages, type }) => {
+  sock.ev.on('messages.upsert', ({ messages, type }) => {
     if (type !== 'notify') return;
     for (const msg of messages) {
       try {
-        await handleMessage(sock, msg);
+        handleMessage(sock, msg);
       } catch (err) {
-        logger.error({ err }, 'Error handling message');
+        logger.error({ err }, 'Error dispatching message');
       }
     }
   });
@@ -266,9 +318,26 @@ async function startBridge() {
   return sock;
 }
 
-// ── Main ──────────────────────────────────────────────────────────────────────
-logger.info({ DATA_DIR, WORKDIR, CLAUDE_BIN }, 'nyx-baileys-bridge starting');
-startBridge().catch(err => {
-  logger.fatal({ err }, 'Fatal startup error');
-  process.exit(1);
-});
+// ── Main / test export ────────────────────────────────────────────────────────
+if (require.main === module) {
+  healthServer.listen(HEALTH_PORT, () => logger.info(`Health server listening on :${HEALTH_PORT}`));
+  logger.info({ DATA_DIR, WORKDIR, CLAUDE_BIN, AGENT_NAME }, `${AGENT_NAME}-baileys-bridge starting`);
+  startBridge().catch(err => {
+    logger.fatal({ err }, 'Fatal startup error');
+    process.exit(1);
+  });
+} else {
+  // Exported for testing
+  module.exports = {
+    enqueueForChat,
+    invokeClaude,
+    handleClaudeError,
+    buildPrompt,
+    loadHistory,
+    appendHistory,
+    chatQueues,
+    inFlight,
+    AUTH_PATTERNS,
+    AGENT_NAME,
+  };
+}
