@@ -1,0 +1,100 @@
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nyx-data-pvc
+  namespace: bots
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nyx
+  namespace: bots
+  labels:
+    app: nyx
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate  # Required: ReadWriteOnce PVC can only be mounted by one pod
+  selector:
+    matchLabels:
+      app: nyx
+  template:
+    metadata:
+      labels:
+        app: nyx
+    spec:
+      restartPolicy: Always
+      containers:
+        - name: nyx
+          image: nyx-claude:latest
+          env:
+            - name: NYX_DATA_DIR
+              value: /data/nyx
+            - name: NYX_CLAUDE_WORKDIR
+              value: /app
+            - name: NYX_WA_DM_ALLOWLIST
+              valueFrom:
+                secretKeyRef:
+                  name: nyx-secrets
+                  key: wa-dm-allowlist
+                  optional: true
+            - name: NYX_WA_GROUP_POLICY
+              value: "open"
+            - name: NYX_WA_GROUPS
+              valueFrom:
+                secretKeyRef:
+                  name: nyx-secrets
+                  key: wa-groups
+                  optional: true
+            - name: MAYOR_BRIDGE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: nyx-secrets
+                  key: mayor-bridge-url
+                  optional: true
+            - name: MAYOR_BRIDGE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: nyx-secrets
+                  key: mayor-bridge-token
+                  optional: true
+            - name: WHATSAPP_CREDS_JSON
+              valueFrom:
+                secretKeyRef:
+                  name: nyx-secrets
+                  key: whatsapp-creds-json
+                  optional: true
+          resources:
+            limits:
+              cpu: "1"
+              memory: 1Gi
+            requests:
+              cpu: 200m
+              memory: 256Mi
+          livenessProbe:
+            exec:
+              command: ["pgrep", "-f", "node.*baileys-bridge"]
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          volumeMounts:
+            - name: nyx-data
+              mountPath: /data/nyx
+            - name: claude-creds
+              mountPath: /root/.claude
+              readOnly: true
+      volumes:
+        - name: nyx-data
+          persistentVolumeClaim:
+            claimName: nyx-data-pvc
+        - name: claude-creds
+          secret:
+            secretName: nyx-claude-creds
+            optional: true

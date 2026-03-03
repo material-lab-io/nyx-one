@@ -19,6 +19,7 @@
         "anthropic/claude-sonnet-4-5-20250929": { "alias": "Sonnet" },
         "groq/mixtral-8x7b-32768": { "alias": "Groq" }
       },
+      "thinkingDefault": "off",
       "memorySearch": {
         "enabled": false
       },
@@ -57,8 +58,11 @@
             "browser_*"
           ],
           "exec": {
-            "host": "sandbox",
-            "security": "full"
+            "host": "gateway",
+            "security": "full",
+            "pathPrepend": [
+              "/usr/local/bin"
+            ]
           }
         }
       }

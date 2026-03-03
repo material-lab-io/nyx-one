@@ -1,0 +1,87 @@
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: perhitbot-openclaw-pvc
+  namespace: bots
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: perhitbot
+  namespace: bots
+  labels:
+    app: perhitbot
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: perhitbot
+  template:
+    metadata:
+      labels:
+        app: perhitbot
+    spec:
+      restartPolicy: Always
+      containers:
+        - name: openclaw
+          image: openclaw:2026.2.3
+          env:
+            - name: OPENCLAW_GATEWAY_PORT
+              value: "18790"
+            - name: ANTHROPIC_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: perhitbot-secrets
+                  key: anthropic-api-key
+          resources:
+            limits:
+              cpu: "2"
+              memory: 2Gi
+            requests:
+              cpu: 500m
+              memory: 512Mi
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 18790
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 18790
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          volumeMounts:
+            - name: openclaw-data
+              mountPath: /root/.openclaw
+      volumes:
+        - name: openclaw-data
+          persistentVolumeClaim:
+            claimName: perhitbot-openclaw-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: perhitbot
+  namespace: bots
+spec:
+  selector:
+    app: perhitbot
+  ports:
+    - name: gateway
+      port: 18790
+      targetPort: 18790
+  type: ClusterIP

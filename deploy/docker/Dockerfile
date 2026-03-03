@@ -30,6 +30,7 @@ RUN apt-get update && apt-get install -y \
     wget \
     curl \
     socat \
+    pandoc \
     && rm -rf /var/lib/apt/lists/*
 
 # Set Puppeteer to skip downloading Chromium (use system version)
@@ -51,7 +52,7 @@ ENV CLAWDBOT_GATEWAY_PORT=18789
 
 # Health check - check the socat forwarded port
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD curl -f http://localhost:${CLAWDBOT_GATEWAY_PORT}/health || exit 1
+    CMD curl -f http://localhost:${OPENCLAW_GATEWAY_PORT:-18789}/health || exit 1
 
 # Entry point - run via wrapper that sets up port forwarding
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

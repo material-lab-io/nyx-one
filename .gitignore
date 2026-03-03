@@ -64,3 +64,5 @@ test/e2e/.dev.vars
 .claude/
 .logs/
 .beads/
+state.json
+mail/

@@ -1,34 +1,46 @@
 # Deployment Configs
 
-Two deployment options for running OpenClaw agents:
+## Agents
 
-1. **Systemd** (`systemd/`, `agents/`) - Direct installation, simpler for single-server
-2. **Docker** (`docker/`) - Multi-tenant isolation, better for multiple clients
-
-## Quick Reference
-
-| Option | Use Case | Isolation | Setup Complexity |
-|--------|----------|-----------|------------------|
-| Systemd | Single org, 1-2 agents | Shared filesystem | Lower |
-| Docker | Multi-tenant, client isolation | Full container isolation | Higher |
+| Agent | Stack | Status |
+|-------|-------|--------|
+| **Nyx** | Claude Code + Baileys-direct | Migrated (see `baileys/`, `claude-config/`) |
+| **PerhitBot** | OpenClaw + Baileys | Still on openclaw |
 
 ## Structure
 
 ```
 deploy/
+├── baileys/                      # Nyx: standalone Baileys bridge
+│   ├── baileys-bridge.js         # WhatsApp ↔ claude CLI bridge
+│   ├── package.json
+│   └── README.md
+├── claude-config/                # Nyx: Claude Code identity
+│   └── CLAUDE.md                 # Nyx identity + instructions
 ├── systemd/                      # Systemd service files
-│   ├── clawdbot-gateway.service  # Nyx agent (port 18789)
-│   └── clawdbot-perhit.service   # PerhitBot agent (port 18790)
-├── agents/                       # OpenClaw configs
-│   ├── nyx.openclaw.json
-│   └── perhitbot.openclaw.json
-└── docker/                       # Docker multi-tenant setup
-    ├── Dockerfile
-    ├── docker-compose.yml
-    ├── provision-tenant.sh
-    ├── add-to-compose.sh
-    ├── link-whatsapp.sh
-    └── templates/
+│   ├── nyx-baileys.service       # Nyx bridge (new stack)
+│   ├── clawdbot-gateway.service  # Nyx legacy (openclaw, kept for reference)
+│   └── clawdbot-perhit.service   # PerhitBot (openclaw)
+├── agents/                       # OpenClaw configs (legacy / perhitbot)
+│   ├── nyx.openclaw.json         # Nyx openclaw config (archived — not active)
+│   └── perhitbot.openclaw.json   # PerhitBot openclaw config
+├── mayor-bridge/                 # Mayor mail bridge (shared)
+│   ├── mayor-bridge.js           # HTTP adapter: container → gt mail → Mayor
+│   ├── mayor-bridge.service      # Systemd unit
+│   └── nyx-to-mayor              # Helper script
+├── docker/                       # Docker deployment
+│   ├── Dockerfile.nyx-claude     # Nyx: Claude Code + Baileys image
+│   ├── Dockerfile                # Legacy: OpenClaw multi-tenant image
+│   ├── docker-compose.yml        # Compose: nyx (new) + perhitbot (openclaw)
+│   ├── entrypoint-nyx.sh         # Nyx container startup
+│   └── secrets.env.example       # Template for /data/nyx/secrets.env
+└── k8s/                          # Kubernetes manifests
+    ├── namespace.yaml
+    ├── nyx.yaml                  # Nyx deployment (Claude Code + Baileys)
+    ├── nyx-secret.yaml           # Nyx secrets template
+    ├── perhitbot.yaml
+    ├── perhitbot-secret.yaml
+    └── README.md
 ```
 
 ## Setup

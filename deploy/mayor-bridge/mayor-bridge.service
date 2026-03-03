@@ -6,7 +6,7 @@ After=network.target
 Type=simple
 User=kanaba
 EnvironmentFile=/data/mayor-bridge/secrets.env
-ExecStart=/usr/bin/node /home/kanaba/gt/nyx_one/mayor/rig/deploy/mayor-bridge/mayor-bridge.cjs
+ExecStart=/usr/bin/node /home/kanaba/gt/nyx_one/crew/nyx/deploy/mayor-bridge/mayor-bridge.js
 Restart=on-failure
 RestartSec=5
 

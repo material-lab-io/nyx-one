@@ -68,8 +68,12 @@
           "profile": "full",
           "deny": [],
           "exec": {
-            "host": "sandbox",
-            "security": "full"
+            "host": "gateway",
+            "security": "full",
+            "pathPrepend": [
+              "/usr/local/bin",
+              "/home/kanaba/.local/bin"
+            ]
           }
         }
       },
@@ -92,8 +96,12 @@
             "agents_*"
           ],
           "exec": {
-            "host": "sandbox",
-            "security": "full"
+            "host": "gateway",
+            "security": "full",
+            "pathPrepend": [
+              "/usr/local/bin",
+              "/home/kanaba/.local/bin"
+            ]
           }
         }
       }

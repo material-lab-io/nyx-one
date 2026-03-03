@@ -1,0 +1,27 @@
+[Unit]
+Description=Nyx WhatsApp Bridge (Baileys + Claude Code)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=kanaba
+WorkingDirectory=/home/kanaba/gt/nyx_one/crew/nyx/deploy/baileys
+
+# Load secrets (NYX_WA_DM_ALLOWLIST, MAYOR_BRIDGE_URL, MAYOR_BRIDGE_TOKEN, etc.)
+EnvironmentFile=-/data/nyx/secrets.env
+
+Environment=NYX_DATA_DIR=/data/nyx
+Environment=NYX_CLAUDE_WORKDIR=/home/kanaba/gt/nyx_one/crew/nyx/deploy/claude-config
+Environment=NYX_CLAUDE_BIN=/home/kanaba/.local/bin/claude
+Environment=LOG_LEVEL=info
+
+ExecStart=/usr/bin/node /home/kanaba/gt/nyx_one/crew/nyx/deploy/baileys/baileys-bridge.js
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=nyx-baileys
+
+[Install]
+WantedBy=multi-user.target
