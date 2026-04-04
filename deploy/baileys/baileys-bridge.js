@@ -104,10 +104,18 @@ const healthServer = http.createServer((req, res) => {
 });
 
 // ── ACL ───────────────────────────────────────────────────────────────────────
-function isAllowedDM(jid) {
-  const phone = '+' + jid.replace(/@.*$/, '');
+function isAllowedDM(jid, msg) {
   if (DM_ALLOWLIST.includes('*')) return true;
-  return DM_ALLOWLIST.includes(phone);
+  // Standard @s.whatsapp.net JIDs: extract phone directly
+  const phone = '+' + jid.replace(/@.*$/, '').replace(/:.*$/, '');
+  if (DM_ALLOWLIST.includes(phone)) return true;
+  // Linked device @lid JIDs: check msg.key.participant for real phone JID
+  const participant = msg?.key?.participant;
+  if (participant) {
+    const pPhone = '+' + participant.replace(/@.*$/, '').replace(/:.*$/, '');
+    if (DM_ALLOWLIST.includes(pPhone)) return true;
+  }
+  return false;
 }
 
 function isAllowedGroup(jid) {
@@ -212,7 +220,7 @@ async function processMessage(sock, msg) {
       }
     }
   } else {
-    if (!isAllowedDM(jid)) {
+    if (!isAllowedDM(jid, msg)) {
       logger.info({ jid }, 'DM from non-allowlisted sender, ignoring');
       return;
     }
