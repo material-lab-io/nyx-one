@@ -12,7 +12,7 @@ echo "[nyx] Data dir: $DATA_DIR"
 if [ -n "${WHATSAPP_CREDS_JSON:-}" ]; then
   echo "[nyx] Extracting Baileys credentials from WHATSAPP_CREDS_JSON..."
   mkdir -p "$CREDS_DIR"
-  echo "$WHATSAPP_CREDS_JSON" | base64 -d > "$CREDS_DIR/creds.json"
+  echo "$WHATSAPP_CREDS_JSON" > "$CREDS_DIR/creds.json"
   echo "[nyx] Credentials extracted"
 fi
 
@@ -24,7 +24,7 @@ if ! command -v "$CLAUDE_BIN" >/dev/null 2>&1; then
 fi
 
 # Quick auth check — fails if not logged in
-if ! "$CLAUDE_BIN" -p "ping" --system "reply pong" --no-markdown >/dev/null 2>&1; then
+if ! "$CLAUDE_BIN" -p "ping" --system "reply pong" --output-format text >/dev/null 2>&1; then
   echo "[nyx] WARNING: claude auth check failed — ensure ~/.claude is mounted with valid credentials"
   echo "[nyx] To authenticate: docker run -it --rm -v \$HOME/.claude:/root/.claude nyx-claude claude auth login"
 fi
