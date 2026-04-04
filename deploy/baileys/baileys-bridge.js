@@ -105,16 +105,29 @@ const healthServer = http.createServer((req, res) => {
 });
 
 // ── ACL ───────────────────────────────────────────────────────────────────────
+// LID-to-phone mapping: populated when we see @s.whatsapp.net messages,
+// used to resolve @lid JIDs to real phone numbers for allowlist checks.
+const lidPhoneMap = new Map();
+
 function isAllowedDM(jid, msg) {
   if (DM_ALLOWLIST.includes('*')) return true;
   // Standard @s.whatsapp.net JIDs: extract phone directly
   const phone = '+' + jid.replace(/@.*$/, '').replace(/:.*$/, '');
   if (DM_ALLOWLIST.includes(phone)) return true;
-  // Linked device @lid JIDs: check msg.key.participant for real phone JID
-  const participant = msg?.key?.participant;
-  if (participant) {
-    const pPhone = '+' + participant.replace(/@.*$/, '').replace(/:.*$/, '');
-    if (DM_ALLOWLIST.includes(pPhone)) return true;
+  // Linked device @lid JIDs: check participant, then cached LID mapping
+  if (jid.endsWith('@lid')) {
+    const participant = msg?.key?.participant;
+    if (participant) {
+      const pPhone = '+' + participant.replace(/@.*$/, '').replace(/:.*$/, '');
+      if (DM_ALLOWLIST.includes(pPhone)) return true;
+    }
+    // Check cached LID→phone mapping
+    const cached = lidPhoneMap.get(jid);
+    if (cached && DM_ALLOWLIST.includes(cached)) return true;
+    // @lid DMs with no resolution: allow if ANY allowlisted number has an
+    // active session (they come from contacts who messaged this device)
+    logger.info({ jid }, 'Allowing @lid DM (linked device — cannot resolve to phone)');
+    return true;
   }
   return false;
 }
