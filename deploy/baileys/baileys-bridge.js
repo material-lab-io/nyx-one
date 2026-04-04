@@ -184,6 +184,7 @@ function invokeClaude(prompt) {
     const child = spawn(CLAUDE_BIN, ['-p', prompt, '--output-format', 'text'], {
       cwd: WORKDIR,
       env: { ...process.env },
+      stdio: ['ignore', 'pipe', 'pipe'],
       timeout: 120000,
     });
 
