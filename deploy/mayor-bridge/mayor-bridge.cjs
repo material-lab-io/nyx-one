@@ -10,6 +10,8 @@ const PORT = parseInt(process.env.MAYOR_BRIDGE_PORT || '19000', 10);
 const TOKEN = process.env.MAYOR_BRIDGE_TOKEN;
 const ALLOWED_FROM = ['nyx', 'princess', 'sailor', 'gymbo', 'perhit'];
 const GT_DIR = process.env.GT_DIR || '/home/kanaba/gt';
+// Direct routing destinations (bypass mayor). Others go to mayor/ with [→to] hint.
+const DIRECT_ROUTES = new Set(['cargo_spear/luna', 'sailor/sailor', 'gymbo/coach']);
 
 if (!TOKEN) { console.error('MAYOR_BRIDGE_TOKEN not set'); process.exit(1); }
 
@@ -40,19 +42,34 @@ http.createServer((req, res) => {
       return;
     }
 
-    const dest = to ? ` [→${to}]` : '';
-    const child = execFile('gt', ['mail', 'send', 'mayor/', '-s', `${from}:${subject}${dest}`, '--stdin'], {
+    // Route directly if destination is in allowlist, otherwise send to mayor with hint
+    let mailDest = 'mayor/';
+    let mailSubject = `${from}:${subject}`;
+    if (to && DIRECT_ROUTES.has(to)) {
+      mailDest = to;
+      mailSubject = `${from}:${subject}`;
+    } else if (to) {
+      mailSubject = `${from}:${subject} [→${to}]`;
+    }
+    const gtBin = process.env.GT_BIN || '/home/kanaba/.local/bin/gt';
+    const child = execFile(gtBin, ['mail', 'send', mailDest, '-s', mailSubject, '--stdin'], {
       cwd: GT_DIR,
-      env: { ...process.env, HOME: '/home/kanaba' }
+      env: { ...process.env, HOME: '/home/kanaba', PATH: `/home/kanaba/.local/bin:${process.env.PATH}` }
     });
 
     child.stdin.write(text);
     child.stdin.end();
 
+    child.on('error', err => {
+      res.writeHead(500).end(`exec error: ${err.message}`);
+      console.error(`[mayor-bridge] exec error: ${err.message}`);
+    });
+
     child.on('close', code => {
+      if (res.writableEnded) return;
       if (code === 0) {
         res.writeHead(200).end('ok');
-        console.log(`[mayor-bridge] ${from}:${subject}${dest} → sent`);
+        console.log(`[mayor-bridge] ${from}:${subject} → ${mailDest}`);
       } else {
         res.writeHead(500).end('gt mail failed');
         console.error(`[mayor-bridge] gt mail exited ${code}`);
