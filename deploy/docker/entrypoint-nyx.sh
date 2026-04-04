@@ -9,11 +9,13 @@ echo "[nyx] Starting Nyx (Claude Code + Baileys-direct)"
 echo "[nyx] Data dir: $DATA_DIR"
 
 # ── Restore Baileys credentials from secret ───────────────────────────────────
-if [ -n "${WHATSAPP_CREDS_JSON:-}" ]; then
-  echo "[nyx] Extracting Baileys credentials from WHATSAPP_CREDS_JSON..."
+if [ -n "${WHATSAPP_CREDS_JSON:-}" ] && [ ! -f "$CREDS_DIR/creds.json" ]; then
+  echo "[nyx] Bootstrapping Baileys credentials from secret (no existing creds found)..."
   mkdir -p "$CREDS_DIR"
   echo "$WHATSAPP_CREDS_JSON" > "$CREDS_DIR/creds.json"
-  echo "[nyx] Credentials extracted"
+  echo "[nyx] Credentials bootstrapped"
+else
+  echo "[nyx] Using existing credentials from PVC"
 fi
 
 # ── Verify claude CLI is available and authenticated ─────────────────────────
