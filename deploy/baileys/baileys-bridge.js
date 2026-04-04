@@ -23,6 +23,7 @@
  */
 
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, isJidGroup } = require('@whiskeysockets/baileys');
+const qrcode = require('qrcode-terminal');
 const { execFile, spawn } = require('child_process');
 const fs = require('fs');
 const http = require('http');
@@ -284,7 +285,7 @@ async function startBridge() {
   const sock = makeWASocket({
     auth: state,
     logger: pino({ level: 'warn' }),
-    printQRInTerminal: true,
+    // QR rendered manually via qrcode-terminal in connection.update handler
     markOnlineOnConnect: false,
   });
 
@@ -293,6 +294,7 @@ async function startBridge() {
   sock.ev.on('connection.update', ({ connection, lastDisconnect, qr }) => {
     if (qr) {
       logger.info('QR code generated — scan with charlie account');
+      qrcode.generate(qr, { small: true });
     }
     if (connection === 'close') {
       waConnected = false;
