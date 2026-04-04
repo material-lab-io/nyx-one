@@ -22,7 +22,7 @@
  * NYX_* env vars are accepted as fallbacks for backwards compatibility.
  */
 
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, isJidGroup } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, isJidGroup, fetchLatestBaileysVersion, Browsers } = require('@whiskeysockets/baileys');
 const qrcode = require('qrcode-terminal');
 const { execFile, spawn } = require('child_process');
 const fs = require('fs');
@@ -281,9 +281,13 @@ async function startBridge() {
   fs.mkdirSync(HISTORY_DIR, { recursive: true });
 
   const { state, saveCreds } = await useMultiFileAuthState(CREDS_DIR);
+  const { version } = await fetchLatestBaileysVersion();
+  logger.info({ version }, 'Using WhatsApp Web version');
 
   const sock = makeWASocket({
     auth: state,
+    version,
+    browser: Browsers.ubuntu('Chrome'),
     logger: pino({ level: 'warn' }),
     // QR rendered manually via qrcode-terminal in connection.update handler
     markOnlineOnConnect: false,
