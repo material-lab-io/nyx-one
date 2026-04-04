@@ -97,7 +97,14 @@ spec:
           volumeMounts:
             - name: nyx-data
               mountPath: /data/nyx
+            - name: wa-creds-backup
+              mountPath: /secrets/wa-creds
+              readOnly: true
       volumes:
         - name: nyx-data
           persistentVolumeClaim:
             claimName: nyx-data-pvc
+        - name: wa-creds-backup
+          secret:
+            secretName: nyx-wa-creds-backup
+            optional: true
