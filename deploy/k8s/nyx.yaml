@@ -33,11 +33,21 @@ spec:
       containers:
         - name: nyx
           image: nyx-claude:latest
+          imagePullPolicy: Never
           env:
-            - name: NYX_DATA_DIR
+            - name: BRIDGE_TYPE
+              value: baileys
+            - name: AGENT_NAME
+              value: nyx
+            - name: BRIDGE_DATA_DIR
               value: /data/nyx
-            - name: NYX_CLAUDE_WORKDIR
+            - name: BRIDGE_CLAUDE_WORKDIR
               value: /app
+            - name: CLAUDE_CODE_OAUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: nyx-claude-token
+                  key: oauth-token
             - name: NYX_WA_DM_ALLOWLIST
               valueFrom:
                 secretKeyRef:
@@ -87,14 +97,7 @@ spec:
           volumeMounts:
             - name: nyx-data
               mountPath: /data/nyx
-            - name: claude-creds
-              mountPath: /root/.claude
-              readOnly: true
       volumes:
         - name: nyx-data
           persistentVolumeClaim:
             claimName: nyx-data-pvc
-        - name: claude-creds
-          secret:
-            secretName: nyx-claude-creds
-            optional: true
