@@ -60,14 +60,15 @@ services:
     env_file:
       - /data/nyx/secrets.env
     environment:
-      - NYX_DATA_DIR=/data/nyx
-      - NYX_CLAUDE_WORKDIR=/app
+      - BRIDGE_TYPE=baileys
+      - AGENT_NAME=nyx
+      - BRIDGE_DATA_DIR=/data/nyx
+      - BRIDGE_CLAUDE_WORKDIR=/app
+      # CLAUDE_CODE_OAUTH_TOKEN from secrets.env (generated via: claude setup-token)
       # MAYOR_BRIDGE_URL and MAYOR_BRIDGE_TOKEN from secrets.env
     volumes:
       # Baileys session state + conversation history
       - /data/nyx:/data/nyx
-      # Claude Code credentials (authenticate once with: claude auth login)
-      - /home/kanaba/.claude:/root/.claude:ro
     # tty for QR code display on first run
     tty: true
     stdin_open: true

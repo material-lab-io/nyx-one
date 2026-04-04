@@ -1,0 +1,16 @@
+{
+  "name": "princess-slack-bridge",
+  "version": "1.0.0",
+  "description": "Princess: Slack ↔ Claude Code CLI bridge",
+  "main": "slack-bridge.js",
+  "scripts": {
+    "start": "node slack-bridge.js"
+  },
+  "dependencies": {
+    "@slack/bolt": "^4",
+    "pino": "^9"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

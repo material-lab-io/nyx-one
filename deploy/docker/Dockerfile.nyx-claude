@@ -13,7 +13,7 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Claude Code CLI globally
-# Authenticates via ~/.claude credentials (mount as volume)
+# Authenticates via CLAUDE_CODE_OAUTH_TOKEN env var (from k8s secret)
 RUN npm install -g @anthropic-ai/claude-code
 
 # App directory
@@ -26,26 +26,28 @@ RUN npm install --omit=dev
 COPY deploy/baileys/baileys-bridge.js ./
 
 # Copy Claude Code identity config (CLAUDE.md in workdir is picked up automatically)
-COPY deploy/claude-config/CLAUDE.md ./CLAUDE.md
+COPY deploy/claude-config/nyx/CLAUDE.md ./CLAUDE.md
 
 # Copy mayor bridge helper (available in PATH)
 COPY deploy/mayor-bridge/nyx-to-mayor /usr/local/bin/nyx-to-mayor
 RUN chmod +x /usr/local/bin/nyx-to-mayor
 
 # Copy entrypoint
-COPY deploy/docker/entrypoint-nyx.sh /usr/local/bin/entrypoint.sh
+COPY deploy/docker/entrypoint-bridge.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
-# Data volume: Baileys creds + conversation history + claude credentials
-# Mount /data/nyx for Baileys state, /root/.claude for Claude Code auth
-VOLUME ["/data/nyx", "/root/.claude"]
+# Data volume: Baileys creds + conversation history
+# Auth via CLAUDE_CODE_OAUTH_TOKEN env var — no .claude volume needed
+VOLUME ["/data/nyx"]
 
-ENV NYX_DATA_DIR=/data/nyx
-ENV NYX_CLAUDE_WORKDIR=/app
-ENV NYX_CLAUDE_BIN=claude
+ENV BRIDGE_TYPE=baileys
+ENV AGENT_NAME=nyx
+ENV BRIDGE_DATA_DIR=/data/nyx
+ENV BRIDGE_CLAUDE_WORKDIR=/app
+ENV BRIDGE_CLAUDE_BIN=claude
 
-# Health check: verify the bridge process is alive
+# Health check via HTTP health server (started by bridge)
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
-    CMD pgrep -f "node.*baileys-bridge" > /dev/null || exit 1
+    CMD curl -f http://localhost:8080/ || exit 1
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

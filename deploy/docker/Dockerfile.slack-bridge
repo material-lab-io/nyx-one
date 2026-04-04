@@ -1,0 +1,47 @@
+# Princess Slack Bridge Container
+FROM node:22-slim
+
+LABEL maintainer="nyx-one"
+LABEL description="Princess: Claude Code + Slack bridge"
+
+# System deps
+RUN apt-get update && apt-get install -y \
+    curl \
+    git \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Claude Code CLI globally
+RUN npm install -g @anthropic-ai/claude-code
+
+WORKDIR /app
+
+# Install bridge deps
+COPY deploy/slack/package.json ./
+RUN npm install --omit=dev
+
+COPY deploy/slack/slack-bridge.js ./
+
+# Princess identity (CLAUDE.md in WORKDIR picked up automatically)
+COPY deploy/claude-config/princess/CLAUDE.md ./CLAUDE.md
+
+# Mayor bridge helper
+COPY deploy/mayor-bridge/nyx-to-mayor /usr/local/bin/nyx-to-mayor
+RUN chmod +x /usr/local/bin/nyx-to-mayor
+
+# Generic entrypoint
+COPY deploy/docker/entrypoint-bridge.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
+VOLUME ["/data/princess"]
+
+ENV BRIDGE_TYPE=slack
+ENV AGENT_NAME=princess
+ENV BRIDGE_DATA_DIR=/data/princess
+ENV BRIDGE_CLAUDE_WORKDIR=/app
+ENV BRIDGE_CLAUDE_BIN=claude
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+    CMD curl -f http://localhost:8080/ || exit 1
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

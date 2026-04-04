@@ -2,91 +2,80 @@
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: nyx-data-pvc
+  name: princess-data-pvc
   namespace: bots
 spec:
   accessModes: [ReadWriteOnce]
   resources:
     requests:
-      storage: 5Gi
+      storage: 2Gi
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: nyx
+  name: princess
   namespace: bots
   labels:
-    app: nyx
+    app: princess
 spec:
   replicas: 1
   strategy:
-    type: Recreate  # Required: ReadWriteOnce PVC can only be mounted by one pod
+    type: Recreate
   selector:
     matchLabels:
-      app: nyx
+      app: princess
   template:
     metadata:
       labels:
-        app: nyx
+        app: princess
     spec:
       terminationGracePeriodSeconds: 35
       restartPolicy: Always
       containers:
-        - name: nyx
-          image: nyx-claude:latest
+        - name: princess
+          image: princess-slack:latest
           env:
             - name: BRIDGE_TYPE
-              value: baileys
+              value: slack
             - name: AGENT_NAME
-              value: nyx
+              value: princess
             - name: BRIDGE_DATA_DIR
-              value: /data/nyx
+              value: /data/princess
             - name: BRIDGE_CLAUDE_WORKDIR
               value: /app
             - name: CLAUDE_CODE_OAUTH_TOKEN
               valueFrom:
                 secretKeyRef:
-                  name: nyx-claude-token
+                  name: princess-claude-token
                   key: oauth-token
-            - name: NYX_WA_DM_ALLOWLIST
+            - name: SLACK_BOT_TOKEN
               valueFrom:
                 secretKeyRef:
-                  name: nyx-secrets
-                  key: wa-dm-allowlist
-                  optional: true
-            - name: NYX_WA_GROUP_POLICY
-              value: "open"
-            - name: NYX_WA_GROUPS
+                  name: princess-secrets
+                  key: slack-bot-token
+            - name: SLACK_APP_TOKEN
               valueFrom:
                 secretKeyRef:
-                  name: nyx-secrets
-                  key: wa-groups
+                  name: princess-secrets
+                  key: slack-app-token
+            - name: BRIDGE_SLACK_ALLOWLIST
+              valueFrom:
+                secretKeyRef:
+                  name: princess-secrets
+                  key: bridge-slack-allowlist
                   optional: true
             - name: MAYOR_BRIDGE_URL
               valueFrom:
                 secretKeyRef:
-                  name: nyx-secrets
+                  name: princess-secrets
                   key: mayor-bridge-url
                   optional: true
             - name: MAYOR_BRIDGE_TOKEN
               valueFrom:
                 secretKeyRef:
-                  name: nyx-secrets
+                  name: princess-secrets
                   key: mayor-bridge-token
                   optional: true
-            - name: WHATSAPP_CREDS_JSON
-              valueFrom:
-                secretKeyRef:
-                  name: nyx-secrets
-                  key: whatsapp-creds-json
-                  optional: true
-          resources:
-            limits:
-              cpu: "1"
-              memory: 1Gi
-            requests:
-              cpu: 200m
-              memory: 256Mi
           livenessProbe:
             httpGet:
               path: /
@@ -103,10 +92,17 @@ spec:
             periodSeconds: 10
             timeoutSeconds: 5
             failureThreshold: 3
+          resources:
+            limits:
+              cpu: "1"
+              memory: 1Gi
+            requests:
+              cpu: 200m
+              memory: 256Mi
           volumeMounts:
-            - name: nyx-data
-              mountPath: /data/nyx
+            - name: princess-data
+              mountPath: /data/princess
       volumes:
-        - name: nyx-data
+        - name: princess-data
           persistentVolumeClaim:
-            claimName: nyx-data-pvc
+            claimName: princess-data-pvc
