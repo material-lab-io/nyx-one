@@ -181,7 +181,7 @@ function buildPrompt(chatId, newMessage, senderName) {
 // ── Invoke Claude CLI ─────────────────────────────────────────────────────────
 function invokeClaude(prompt) {
   return new Promise((resolve, reject) => {
-    const child = spawn(CLAUDE_BIN, ['-p', prompt, '--no-markdown'], {
+    const child = spawn(CLAUDE_BIN, ['-p', prompt, '--output-format', 'text'], {
       cwd: WORKDIR,
       env: { ...process.env },
       timeout: 120000,
