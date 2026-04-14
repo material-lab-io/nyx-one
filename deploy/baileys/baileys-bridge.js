@@ -256,7 +256,7 @@ async function transcribeMessage(sock, msg) {
 // ── Invoke Claude CLI ─────────────────────────────────────────────────────────
 function invokeClaude(prompt) {
   return new Promise((resolve, reject) => {
-    const child = spawn(CLAUDE_BIN, ['-p', prompt, '--output-format', 'text'], {
+    const child = spawn(CLAUDE_BIN, ['-p', prompt, '--output-format', 'text', '--dangerously-skip-permissions'], {
       cwd: WORKDIR,
       env: { ...process.env },
       stdio: ['ignore', 'pipe', 'pipe'],
