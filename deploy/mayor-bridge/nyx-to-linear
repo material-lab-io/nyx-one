@@ -1,0 +1,41 @@
+#!/bin/bash
+# nyx-to-linear — Create a Linear ticket from Nyx
+#
+# Usage:
+#   nyx-to-linear "title" "description" [--priority 1-4]
+#
+# Environment:
+#   LINEAR_API_KEY  - Required (from k8s secret nyx-secrets)
+#   LINEAR_TEAM_KEY - Optional (default: FB)
+
+set -euo pipefail
+
+TITLE="${1:?Usage: nyx-to-linear \"title\" \"description\" [--priority 1-4]}"
+DESCRIPTION="${2:?Usage: nyx-to-linear \"title\" \"description\" [--priority 1-4]}"
+PRIORITY=""
+
+shift 2
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --priority)
+      PRIORITY="${2:?--priority requires a value (1-4)}"
+      shift 2
+      ;;
+    *)
+      echo "Unknown argument: $1" >&2
+      exit 1
+      ;;
+  esac
+done
+
+if [ -z "${LINEAR_API_KEY:-}" ]; then
+  echo "Error: LINEAR_API_KEY not set" >&2
+  exit 1
+fi
+
+ARGS=("create" "$TITLE" "--description" "$DESCRIPTION")
+if [ -n "$PRIORITY" ]; then
+  ARGS+=("--priority" "$PRIORITY")
+fi
+
+exec linear "${ARGS[@]}"

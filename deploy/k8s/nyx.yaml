@@ -80,6 +80,18 @@ spec:
                   name: nyx-secrets
                   key: whatsapp-creds-json
                   optional: true
+            - name: LINEAR_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: nyx-secrets
+                  key: linear-api-key
+                  optional: true
+            - name: LINEAR_TEAM_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: nyx-secrets
+                  key: linear-team-key
+                  optional: true
           resources:
             limits:
               cpu: "1"

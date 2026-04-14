@@ -1,0 +1,9 @@
+{
+  "name": "linear-cli",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Linear CLI for Nyx",
+  "dependencies": {
+    "@linear/sdk": "^29.0.0"
+  }
+}

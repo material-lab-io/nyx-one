@@ -28,9 +28,20 @@ COPY deploy/baileys/baileys-bridge.js ./
 # Copy Claude Code identity config (CLAUDE.md in workdir is picked up automatically)
 COPY deploy/claude-config/nyx/CLAUDE.md ./CLAUDE.md
 
+# Install Linear CLI
+COPY deploy/linear-cli/package.json /app/linear-cli/
+RUN cd /app/linear-cli && npm install --omit=dev
+COPY deploy/linear-cli/linear-cli.js /app/linear-cli/
+RUN printf '#!/bin/sh\nexec node /app/linear-cli/linear-cli.js "$@"\n' > /usr/local/bin/linear \
+    && chmod +x /usr/local/bin/linear
+
 # Copy mayor bridge helper (available in PATH)
 COPY deploy/mayor-bridge/nyx-to-mayor /usr/local/bin/nyx-to-mayor
 RUN chmod +x /usr/local/bin/nyx-to-mayor
+
+# Copy Linear ticket helper (available in PATH)
+COPY deploy/mayor-bridge/nyx-to-linear /usr/local/bin/nyx-to-linear
+RUN chmod +x /usr/local/bin/nyx-to-linear
 
 # Copy entrypoint
 COPY deploy/docker/entrypoint-bridge.sh /usr/local/bin/entrypoint.sh
