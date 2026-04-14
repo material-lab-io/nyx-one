@@ -269,8 +269,9 @@ function invokeClaude(prompt) {
       if (code === 0) {
         resolve(stdout.trim());
       } else {
-        const err = new Error(`claude exited ${code}: ${stderr.slice(0, 500)}`);
-        err.stderr = stderr;
+        const combined = (stdout + stderr).slice(0, 500);
+        const err = new Error(`claude exited ${code}: ${combined}`);
+        err.stderr = combined;
         reject(err);
       }
     });
