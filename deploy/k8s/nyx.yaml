@@ -34,6 +34,7 @@ spec:
       containers:
         - name: nyx
           image: nyx-claude:latest
+          imagePullPolicy: Never
           env:
             - name: BRIDGE_TYPE
               value: baileys
