@@ -1,0 +1,53 @@
+#!/bin/bash
+# nyx-notes — Append a notable interaction to today's notes on the PVC
+# Notes are stored at /data/nyx/notes/YYYY-MM-DD.md
+#
+# Usage:
+#   nyx-notes "Title" "Content"
+#   nyx-notes --topic research "Title" "Content"
+#   nyx-notes --topic decision "Title" "Content"
+#   nyx-notes --topic transcription "Title" "Content"
+
+set -euo pipefail
+
+NOTES_DIR="${BRIDGE_DATA_DIR:-/data/nyx}/notes"
+TOPIC="general"
+
+# Parse optional --topic flag
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --topic)
+      TOPIC="${2:?--topic requires a value}"
+      shift 2
+      ;;
+    -*)
+      echo "Unknown flag: $1" >&2
+      exit 1
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
+TITLE="${1:?Usage: nyx-notes [--topic TYPE] \"Title\" \"Content\"}"
+CONTENT="${2:?Usage: nyx-notes [--topic TYPE] \"Title\" \"Content\"}"
+
+DATE="$(date +%Y-%m-%d)"
+TIMESTAMP="$(date +%H:%M)"
+NOTES_FILE="$NOTES_DIR/$DATE.md"
+
+mkdir -p "$NOTES_DIR"
+
+# Create file with date header if it doesn't exist yet
+if [ ! -f "$NOTES_FILE" ]; then
+  printf '# Notes — %s\n\n' "$DATE" > "$NOTES_FILE"
+fi
+
+# Append the entry
+{
+  printf '\n## %s — %s [%s]\n\n' "$TIMESTAMP" "$TITLE" "$TOPIC"
+  printf '%s\n' "$CONTENT"
+} >> "$NOTES_FILE"
+
+echo "Saved: $NOTES_FILE"

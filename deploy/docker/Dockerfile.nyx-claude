@@ -43,6 +43,10 @@ RUN chmod +x /usr/local/bin/nyx-to-mayor
 COPY deploy/mayor-bridge/nyx-to-linear /usr/local/bin/nyx-to-linear
 RUN chmod +x /usr/local/bin/nyx-to-linear
 
+# Copy notes helper (available in PATH)
+COPY deploy/mayor-bridge/nyx-notes /usr/local/bin/nyx-notes
+RUN chmod +x /usr/local/bin/nyx-notes
+
 # Copy entrypoint
 COPY deploy/docker/entrypoint-bridge.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
