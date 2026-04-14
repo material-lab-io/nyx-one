@@ -32,6 +32,10 @@ COPY deploy/claude-config/nyx/CLAUDE.md ./CLAUDE.md
 COPY deploy/mayor-bridge/nyx-to-mayor /usr/local/bin/nyx-to-mayor
 RUN chmod +x /usr/local/bin/nyx-to-mayor
 
+# Copy notes helper (available in PATH)
+COPY deploy/mayor-bridge/nyx-notes /usr/local/bin/nyx-notes
+RUN chmod +x /usr/local/bin/nyx-notes
+
 # Copy entrypoint
 COPY deploy/docker/entrypoint-bridge.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
