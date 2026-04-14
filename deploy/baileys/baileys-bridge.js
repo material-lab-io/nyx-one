@@ -22,7 +22,7 @@
  * NYX_* env vars are accepted as fallbacks for backwards compatibility.
  */
 
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, isJidGroup, fetchLatestBaileysVersion, Browsers } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, isJidGroup, fetchLatestBaileysVersion, Browsers, downloadMediaMessage } = require('@whiskeysockets/baileys');
 const qrcode = require('qrcode-terminal');
 const { execFile, spawn } = require('child_process');
 const fs = require('fs');
@@ -47,6 +47,11 @@ try { GROUPS_CONFIG = JSON.parse(process.env.BRIDGE_WA_GROUPS || process.env.NYX
 
 const CREDS_DIR   = path.join(DATA_DIR, 'creds');
 const HISTORY_DIR = path.join(DATA_DIR, 'conversations');
+
+// ── Groq STT config ───────────────────────────────────────────────────────────
+const GROQ_API_KEY    = process.env.GROQ_API_KEY || '';
+const GROQ_STT_URL    = (process.env.GROQ_STT_BASE_URL || 'https://api.groq.com/openai/v1').replace(/\/+$/, '') + '/audio/transcriptions';
+const STT_MODEL       = process.env.STT_MODEL || 'whisper-large-v3-turbo';
 
 // ── Logger ────────────────────────────────────────────────────────────────────
 const logger = pino({ level: process.env.LOG_LEVEL || 'info' });
@@ -178,6 +183,72 @@ function buildPrompt(chatId, newMessage, senderName) {
   return lines.join('\n');
 }
 
+// ── Groq Whisper transcription ────────────────────────────────────────────────
+
+/**
+ * Send an audio buffer to Groq Whisper and return the transcript text.
+ * Returns null if GROQ_API_KEY is not set or if transcription fails.
+ *
+ * @param {Buffer} buffer - Raw audio bytes
+ * @param {string} mime   - MIME type (e.g. 'audio/ogg', 'audio/mp4')
+ * @returns {Promise<string|null>}
+ */
+async function transcribeGroq(buffer, mime) {
+  if (!GROQ_API_KEY) {
+    logger.warn('GROQ_API_KEY not set — cannot transcribe audio');
+    return null;
+  }
+
+  // Map MIME → file extension for the multipart filename
+  const mimeToExt = { 'audio/ogg': 'ogg', 'audio/mp4': 'mp4', 'audio/mpeg': 'mp3',
+    'audio/webm': 'webm', 'audio/wav': 'wav', 'audio/x-m4a': 'm4a', 'audio/m4a': 'm4a' };
+  const ext = mimeToExt[mime.split(';')[0].trim()] || 'ogg';
+
+  const form = new FormData();
+  form.append('file', new Blob([buffer], { type: mime }), `audio.${ext}`);
+  form.append('model', STT_MODEL);
+
+  const res = await fetch(GROQ_STT_URL, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${GROQ_API_KEY}` },
+    body: form,
+  });
+
+  if (!res.ok) {
+    const detail = await res.text().catch(() => '');
+    throw new Error(`Groq STT HTTP ${res.status}: ${detail.slice(0, 200)}`);
+  }
+
+  const data = await res.json();
+  return data.text?.trim() || null;
+}
+
+/**
+ * Download audio from a Baileys message and transcribe via Groq Whisper.
+ * Returns the transcript string, or null on failure.
+ *
+ * @param {import('@whiskeysockets/baileys').WASocket} sock
+ * @param {import('@whiskeysockets/baileys').WAMessage} msg
+ * @returns {Promise<string|null>}
+ */
+async function transcribeMessage(sock, msg) {
+  try {
+    const buffer = await downloadMediaMessage(
+      msg,
+      'buffer',
+      {},
+      { logger, reuploadRequest: sock.updateMediaMessage },
+    );
+    const mime = msg.message?.pttMessage?.mimetype
+      || msg.message?.audioMessage?.mimetype
+      || 'audio/ogg';
+    return await transcribeGroq(buffer, mime);
+  } catch (err) {
+    logger.error({ err }, 'Audio transcription failed');
+    return null;
+  }
+}
+
 // ── Invoke Claude CLI ─────────────────────────────────────────────────────────
 function invokeClaude(prompt) {
   return new Promise((resolve, reject) => {
@@ -220,12 +291,15 @@ async function processMessage(sock, msg) {
     || msg.message?.videoMessage?.caption
     || '';
 
-  if (!text.trim()) return;
+  const isAudio = !!(msg.message?.audioMessage || msg.message?.pttMessage);
 
-  // ACL checks
+  if (!text.trim() && !isAudio) return;
+
+  // ACL checks (before transcription to avoid wasting API credits on blocked senders)
   if (isGroup) {
     if (!isAllowedGroup(jid)) return;
-    if (requiresMention(jid)) {
+    if (requiresMention(jid) && !isAudio) {
+      // Audio/PTT messages cannot carry @mentions — skip mention check for them
       const botNumber = botJid.replace(/:.*@/, '@');
       if (!text.includes('@' + botNumber.replace('@s.whatsapp.net', ''))) {
         const mentioned = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid || [];
@@ -244,12 +318,25 @@ async function processMessage(sock, msg) {
   const senderJid  = msg.key.participant || jid;
   const senderName = msg.pushName || senderJid.replace(/@.*$/, '');
 
-  logger.info({ jid, sender: senderName, isGroup }, 'Received message: %s', text.slice(0, 80));
+  // Transcribe audio/PTT messages via Groq Whisper
+  let effectiveText = text;
+  if (isAudio) {
+    logger.info({ jid, sender: senderName }, 'Audio/PTT message — transcribing via Groq Whisper');
+    const transcript = await transcribeMessage(sock, msg);
+    if (!transcript) {
+      logger.warn({ jid }, 'Transcription returned empty — ignoring audio message');
+      return;
+    }
+    effectiveText = `[Voice message transcription]: ${transcript}`;
+    logger.info({ jid, transcriptLen: transcript.length }, 'Transcription complete');
+  }
+
+  logger.info({ jid, sender: senderName, isGroup }, 'Received message: %s', effectiveText.slice(0, 80));
 
   await sock.sendPresenceUpdate('composing', jid);
-  appendHistory(jid, 'user', `${senderName}: ${text}`);
+  appendHistory(jid, 'user', `${senderName}: ${effectiveText}`);
 
-  const prompt = buildPrompt(jid, text, senderName);
+  const prompt = buildPrompt(jid, effectiveText, senderName);
 
   let reply;
   const claudePromise = invokeClaude(prompt);
@@ -363,9 +450,12 @@ if (require.main === module) {
     buildPrompt,
     loadHistory,
     appendHistory,
+    transcribeGroq,
     chatQueues,
     inFlight,
     AUTH_PATTERNS,
     AGENT_NAME,
+    GROQ_STT_URL,
+    STT_MODEL,
   };
 }

@@ -71,6 +71,9 @@ echo "$WHATSAPP_CREDS_JSON" | base64 -d > $NYX_DATA_DIR/creds/creds.json
 | `NYX_MAX_HISTORY` | `20` | Max conversation turns in context |
 | `MAYOR_BRIDGE_URL` | — | If set, enables nyx-to-mayor HTTP calls |
 | `MAYOR_BRIDGE_TOKEN` | — | Token for mayor bridge |
+| `GROQ_API_KEY` | — | Groq API key for Voice/PTT transcription (Whisper) |
+| `GROQ_STT_BASE_URL` | `https://api.groq.com/openai/v1` | Override Groq STT base URL |
+| `STT_MODEL` | `whisper-large-v3-turbo` | Whisper model to use |
 | `LOG_LEVEL` | `info` | Pino log level |
 
 ## Running with systemd
