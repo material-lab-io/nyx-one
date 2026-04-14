@@ -29,7 +29,7 @@ spec:
       labels:
         app: nyx
     spec:
-      terminationGracePeriodSeconds: 35
+      terminationGracePeriodSeconds: 320
       restartPolicy: Always
       containers:
         - name: nyx

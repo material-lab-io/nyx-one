@@ -81,11 +81,11 @@ function enqueueForChat(chatId, thunk) {
 
 // ── SIGTERM handler (25s drain) ───────────────────────────────────────────────
 process.on('SIGTERM', async () => {
-  logger.info('SIGTERM received — draining in-flight requests (up to 25s)');
+  logger.info('SIGTERM received — draining in-flight requests (up to 310s)');
   shuttingDown = true;
   await Promise.race([
     Promise.all([...inFlight]),
-    new Promise(r => setTimeout(r, 25000)),
+    new Promise(r => setTimeout(r, 310000)),
   ]);
   logger.info('Drain complete — exiting');
   process.exit(0);
@@ -260,7 +260,7 @@ function invokeClaude(prompt) {
       cwd: WORKDIR,
       env: { ...process.env },
       stdio: ['ignore', 'pipe', 'pipe'],
-      timeout: 120000,
+      timeout: 300000,
     });
 
     let stdout = '';
