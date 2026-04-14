@@ -25,6 +25,10 @@ RUN npm install --omit=dev
 
 COPY deploy/baileys/baileys-bridge.js ./
 
+# Patch Baileys: use allSettled so fetchProps failure doesn't abort executeInitQueries
+RUN sed -i 's/await Promise\.all(\[fetchProps(), fetchBlocklist(), fetchPrivacySettings()\])/await Promise.allSettled([fetchProps(), fetchBlocklist(), fetchPrivacySettings()])/' \
+    /app/node_modules/@whiskeysockets/baileys/lib/Socket/chats.js
+
 # Copy Claude Code identity config (CLAUDE.md in workdir is picked up automatically)
 COPY deploy/claude-config/nyx/CLAUDE.md ./CLAUDE.md
 

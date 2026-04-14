@@ -393,6 +393,11 @@ async function startBridge() {
     logger: pino({ level: 'warn' }),
     // QR rendered manually via qrcode-terminal in connection.update handler
     markOnlineOnConnect: false,
+    // Needed for retry/re-key when group message decryption fails
+    getMessage: async (key) => {
+      logger.debug({ key }, 'getMessage called (retry/re-key request)');
+      return { conversation: '' };
+    },
   });
 
   sock.ev.on('creds.update', saveCreds);
