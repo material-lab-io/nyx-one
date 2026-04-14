@@ -35,7 +35,7 @@ const pino = require('pino');
 const DATA_DIR     = process.env.BRIDGE_DATA_DIR       || process.env.NYX_DATA_DIR      || '/data/nyx';
 const WORKDIR      = process.env.BRIDGE_CLAUDE_WORKDIR || process.env.NYX_CLAUDE_WORKDIR || '/app';
 const CLAUDE_BIN   = process.env.BRIDGE_CLAUDE_BIN     || process.env.NYX_CLAUDE_BIN     || 'claude';
-const MAX_HISTORY  = parseInt(process.env.BRIDGE_MAX_HISTORY || process.env.NYX_MAX_HISTORY || '20', 10);
+const MAX_HISTORY  = parseInt(process.env.BRIDGE_MAX_HISTORY || process.env.NYX_MAX_HISTORY || '10', 10);
 const HEALTH_PORT  = parseInt(process.env.BRIDGE_HEALTH_PORT || '8080', 10);
 const AGENT_NAME   = process.env.AGENT_NAME         || 'nyx';
 const DISPLAY_NAME = process.env.AGENT_DISPLAY_NAME || AGENT_NAME;
@@ -176,11 +176,16 @@ function appendHistory(chatId, role, content) {
 }
 
 // ── Build prompt with history ─────────────────────────────────────────────────
+const MAX_ENTRY_CHARS = 800; // truncate long history entries to keep context bounded
+
 function buildPrompt(chatId, newMessage, senderName) {
   const history = loadHistory(chatId);
   const lines = [];
   for (const h of history) {
-    lines.push(h.role === 'user' ? `User: ${h.content}` : `${DISPLAY_NAME}: ${h.content}`);
+    const body = h.content.length > MAX_ENTRY_CHARS
+      ? h.content.slice(0, MAX_ENTRY_CHARS) + '…[truncated]'
+      : h.content;
+    lines.push(h.role === 'user' ? `User: ${body}` : `${DISPLAY_NAME}: ${body}`);
   }
   lines.push(`User (${senderName}): ${newMessage}`);
   return lines.join('\n');
@@ -256,7 +261,7 @@ async function transcribeMessage(sock, msg) {
 // ── Invoke Claude CLI ─────────────────────────────────────────────────────────
 function invokeClaude(prompt) {
   return new Promise((resolve, reject) => {
-    const child = spawn(CLAUDE_BIN, ['-p', prompt, '--output-format', 'text', '--dangerously-skip-permissions'], {
+    const child = spawn(CLAUDE_BIN, ['-p', prompt, '--output-format', 'text', '--dangerously-skip-permissions', '--max-turns', '15'], {
       cwd: WORKDIR,
       env: { ...process.env },
       stdio: ['ignore', 'pipe', 'pipe'],
