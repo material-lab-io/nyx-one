@@ -1,0 +1,95 @@
+#!/bin/bash
+# nyx-send-email — Send an email from Nyx (nyx@materiallab.io)
+# In container: POSTs to mayor-bridge /email endpoint
+# On host:      calls sailor Gmail client directly via Python
+#
+# Usage:
+#   nyx-send-email "to@email.com" "Subject" "Body text"
+#   nyx-send-email "to@email.com" "Subject" "Body text" --attach /path/to/file
+
+set -euo pipefail
+
+TO="${1:?Usage: nyx-send-email \"to\" \"subject\" \"body\" [--attach /path/to/file]}"
+SUBJECT="${2:?Usage: nyx-send-email \"to\" \"subject\" \"body\" [--attach /path/to/file]}"
+BODY="${3:?Usage: nyx-send-email \"to\" \"subject\" \"body\" [--attach /path/to/file]}"
+ATTACH_PATH=""
+
+# Parse optional --attach argument
+shift 3
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --attach)
+      ATTACH_PATH="${2:?--attach requires a file path}"
+      shift 2
+      ;;
+    *)
+      echo "Unknown argument: $1" >&2
+      exit 1
+      ;;
+  esac
+done
+
+if [ -n "${MAYOR_BRIDGE_URL:-}" ]; then
+  # Container mode: POST to mayor-bridge /email via node (no curl/wget in image)
+  TO="$TO" SUBJECT="$SUBJECT" BODY="$BODY" ATTACH_PATH="$ATTACH_PATH" \
+  MAYOR_BRIDGE_TOKEN="${MAYOR_BRIDGE_TOKEN:?MAYOR_BRIDGE_TOKEN not set}" \
+  node -e "
+const http = require('${MAYOR_BRIDGE_URL}'.startsWith('https') ? 'https' : 'http');
+const url = new URL('${MAYOR_BRIDGE_URL}/email'.replace(/'/g, ''));
+const payload = JSON.stringify({
+  to: process.env.TO,
+  subject: process.env.SUBJECT,
+  body: process.env.BODY,
+  ...(process.env.ATTACH_PATH ? { attach: process.env.ATTACH_PATH } : {})
+});
+const opts = {
+  hostname: url.hostname,
+  port: url.port || (url.protocol === 'https:' ? 443 : 80),
+  path: url.pathname,
+  method: 'POST',
+  headers: {
+    'Content-Type': 'application/json',
+    'Authorization': 'Bearer ' + process.env.MAYOR_BRIDGE_TOKEN,
+    'Content-Length': Buffer.byteLength(payload)
+  }
+};
+const req = http.request(opts, res => {
+  let data = '';
+  res.on('data', d => data += d);
+  res.on('end', () => {
+    if (res.statusCode >= 200 && res.statusCode < 300) {
+      process.stdout.write('ok\n');
+    } else {
+      process.stderr.write('bridge error ' + res.statusCode + ': ' + data + '\n');
+      process.exit(1);
+    }
+  });
+});
+req.on('error', e => { process.stderr.write('request failed: ' + e.message + '\n'); process.exit(1); });
+req.write(payload);
+req.end();
+"
+else
+  # Host mode: call sailor Gmail client directly
+  python3 - <<PYEOF
+import sys
+sys.path.insert(0, '/home/kanaba/gt/sailor/crew/sailor/founding-sales-skills/material-lab')
+from gmail.client import GmailClient
+from gmail.auth import get_credentials
+
+to = """${TO}"""
+subject = """${SUBJECT}"""
+body = """${BODY}"""
+attach = """${ATTACH_PATH}"""
+
+creds = get_credentials('nyx')
+client = GmailClient(credentials=creds)
+
+kwargs = {'to': to, 'subject': subject, 'body_text': body}
+if attach:
+    kwargs['attachments'] = [attach]
+
+client.send_email(**kwargs)
+print('ok')
+PYEOF
+fi

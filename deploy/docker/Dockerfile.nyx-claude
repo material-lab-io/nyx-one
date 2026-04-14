@@ -39,9 +39,13 @@ COPY deploy/linear-cli/linear-cli.js /app/linear-cli/
 RUN printf '#!/bin/sh\nexec node /app/linear-cli/linear-cli.js "$@"\n' > /usr/local/bin/linear \
     && chmod +x /usr/local/bin/linear
 
-# Copy mayor bridge helper (available in PATH)
+# Copy mayor bridge helpers (available in PATH)
 COPY deploy/mayor-bridge/nyx-to-mayor /usr/local/bin/nyx-to-mayor
-RUN chmod +x /usr/local/bin/nyx-to-mayor
+COPY deploy/mayor-bridge/nyx-send-email /usr/local/bin/nyx-send-email
+RUN chmod +x /usr/local/bin/nyx-to-mayor /usr/local/bin/nyx-send-email
+
+# Temp dir for media downloads (images, documents)
+RUN mkdir -p /app/tmp
 
 # Copy Linear ticket helper (available in PATH)
 COPY deploy/mayor-bridge/nyx-to-linear /usr/local/bin/nyx-to-linear

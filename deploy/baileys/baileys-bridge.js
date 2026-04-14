@@ -25,6 +25,7 @@
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, isJidGroup, fetchLatestBaileysVersion, Browsers, downloadMediaMessage } = require('@whiskeysockets/baileys');
 const qrcode = require('qrcode-terminal');
 const { execFile, spawn } = require('child_process');
+const { randomUUID } = require('crypto');
 const fs = require('fs');
 const http = require('http');
 const path = require('path');
@@ -45,13 +46,15 @@ const GROUP_POLICY = process.env.BRIDGE_WA_GROUP_POLICY || process.env.NYX_WA_GR
 let GROUPS_CONFIG = {};
 try { GROUPS_CONFIG = JSON.parse(process.env.BRIDGE_WA_GROUPS || process.env.NYX_WA_GROUPS || '{}'); } catch {}
 
+const TMP_DIR = '/app/tmp';
+
 const CREDS_DIR   = path.join(DATA_DIR, 'creds');
 const HISTORY_DIR = path.join(DATA_DIR, 'conversations');
 
 // ── Groq STT config ───────────────────────────────────────────────────────────
-const GROQ_API_KEY    = process.env.GROQ_API_KEY || '';
-const GROQ_STT_URL    = (process.env.GROQ_STT_BASE_URL || 'https://api.groq.com/openai/v1').replace(/\/+$/, '') + '/audio/transcriptions';
-const STT_MODEL       = process.env.STT_MODEL || 'whisper-large-v3-turbo';
+const GROQ_API_KEY = process.env.GROQ_API_KEY || '';
+const GROQ_STT_URL = (process.env.GROQ_STT_BASE_URL || 'https://api.groq.com/openai/v1').replace(/\/+$/, '') + '/audio/transcriptions';
+const STT_MODEL    = process.env.STT_MODEL || 'whisper-large-v3-turbo';
 
 // ── Logger ────────────────────────────────────────────────────────────────────
 const logger = pino({ level: process.env.LOG_LEVEL || 'info' });
@@ -280,31 +283,112 @@ function invokeClaude(prompt) {
   });
 }
 
+// ── Media content extraction ──────────────────────────────────────────────────
+// Returns { content: string, tempFiles: string[] }
+// tempFiles are cleaned up after Claude responds.
+// sock is passed for audio to enable media reupload on stale messages.
+async function extractContent(msg, sock) {
+  const m = msg.message;
+  if (!m) return { content: '', tempFiles: [] };
+
+  // Plain text
+  const text = m.conversation || m.extendedTextMessage?.text || '';
+  if (text) return { content: text, tempFiles: [] };
+
+  // Audio / Voice note — delegate to transcribeMessage (handles MIME + reupload)
+  if (m.audioMessage || m.pttMessage) {
+    if (!GROQ_API_KEY) {
+      return { content: '[voice note - transcription unavailable]', tempFiles: [] };
+    }
+    const transcript = await transcribeMessage(sock, msg);
+    if (!transcript) {
+      return { content: '[voice note - could not transcribe]', tempFiles: [] };
+    }
+    return { content: `[Voice note transcript]: ${transcript}`, tempFiles: [] };
+  }
+
+  // Image
+  if (m.imageMessage) {
+    const caption = m.imageMessage.caption || '';
+    try {
+      const buf = await downloadMediaMessage(msg, 'buffer', {});
+      const tmpPath = path.join(TMP_DIR, `${randomUUID()}.jpg`);
+      fs.mkdirSync(TMP_DIR, { recursive: true });
+      fs.writeFileSync(tmpPath, buf);
+      const captionPart = caption ? ` Caption: ${caption}` : '';
+      return {
+        content: `User sent an image, saved at ${tmpPath}.${captionPart}`,
+        tempFiles: [tmpPath],
+      };
+    } catch (err) {
+      logger.error({ err }, 'Image download failed');
+      return { content: caption || '[image - could not download]', tempFiles: [] };
+    }
+  }
+
+  // Video (no download — too large, no ffmpeg)
+  if (m.videoMessage) {
+    const caption = m.videoMessage.caption || '';
+    return { content: `[Video message]${caption ? ` Caption: ${caption}` : ''}`, tempFiles: [] };
+  }
+
+  // Document
+  if (m.documentMessage) {
+    const { fileName = 'document', mimetype = 'application/octet-stream', fileLength } = m.documentMessage;
+    const sizeBytes = fileLength ? Number(fileLength) : 0;
+    const MAX_DOC = 5 * 1024 * 1024;
+    if (sizeBytes > 0 && sizeBytes <= MAX_DOC) {
+      try {
+        const buf = await downloadMediaMessage(msg, 'buffer', {});
+        const tmpPath = path.join(TMP_DIR, `${randomUUID()}-${fileName}`);
+        fs.mkdirSync(TMP_DIR, { recursive: true });
+        fs.writeFileSync(tmpPath, buf);
+        return {
+          content: `User sent a document: ${fileName} (${mimetype}), saved at ${tmpPath}`,
+          tempFiles: [tmpPath],
+        };
+      } catch (err) {
+        logger.error({ err }, 'Document download failed');
+        return { content: `User sent a document: ${fileName} (${mimetype}) — could not download`, tempFiles: [] };
+      }
+    }
+    const sizePart = sizeBytes ? ` — ${(sizeBytes / 1024 / 1024).toFixed(1)}MB, too large to download` : '';
+    return { content: `User sent a document: ${fileName} (${mimetype})${sizePart}`, tempFiles: [] };
+  }
+
+  return { content: '', tempFiles: [] };
+}
+
 // ── Process one message (serialized per chatId) ───────────────────────────────
 async function processMessage(sock, msg) {
   const jid     = msg.key.remoteJid;
   const isGroup = isJidGroup(jid);
   const botJid  = sock.user?.id || '';
 
-  const text = msg.message?.conversation
-    || msg.message?.extendedTextMessage?.text
-    || msg.message?.imageMessage?.caption
-    || msg.message?.videoMessage?.caption
-    || '';
+  // Extract content — async (may transcribe audio or download media)
+  const { content, tempFiles } = await extractContent(msg, sock);
 
-  const isAudio = !!(msg.message?.audioMessage || msg.message?.pttMessage);
+  if (!content.trim()) return;
 
-  if (!text.trim() && !isAudio) return;
-
-  // ACL checks (before transcription to avoid wasting API credits on blocked senders)
+  // ACL checks
   if (isGroup) {
-    if (!isAllowedGroup(jid)) return;
-    if (requiresMention(jid) && !isAudio) {
-      // Audio/PTT messages cannot carry @mentions — skip mention check for them
+    if (!isAllowedGroup(jid)) {
+      for (const f of tempFiles) { try { fs.unlinkSync(f); } catch {} }
+      return;
+    }
+    if (requiresMention(jid)) {
+      // Use caption/text for @mention detection; audio/media carry mentions in contextInfo
+      const mentionText = msg.message?.conversation
+        || msg.message?.extendedTextMessage?.text
+        || msg.message?.imageMessage?.caption
+        || msg.message?.videoMessage?.caption
+        || msg.message?.documentMessage?.caption
+        || '';
       const botNumber = botJid.replace(/:.*@/, '@');
-      if (!text.includes('@' + botNumber.replace('@s.whatsapp.net', ''))) {
+      if (!mentionText.includes('@' + botNumber.replace('@s.whatsapp.net', ''))) {
         const mentioned = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid || [];
         if (!mentioned.includes(botJid) && !mentioned.includes(botJid.replace(/:.*@/, '@'))) {
+          for (const f of tempFiles) { try { fs.unlinkSync(f); } catch {} }
           return;
         }
       }
@@ -312,6 +396,7 @@ async function processMessage(sock, msg) {
   } else {
     if (!isAllowedDM(jid, msg)) {
       logger.info({ jid }, 'DM from non-allowlisted sender, ignoring');
+      for (const f of tempFiles) { try { fs.unlinkSync(f); } catch {} }
       return;
     }
   }
@@ -319,25 +404,12 @@ async function processMessage(sock, msg) {
   const senderJid  = msg.key.participant || jid;
   const senderName = msg.pushName || senderJid.replace(/@.*$/, '');
 
-  // Transcribe audio/PTT messages via Groq Whisper
-  let effectiveText = text;
-  if (isAudio) {
-    logger.info({ jid, sender: senderName }, 'Audio/PTT message — transcribing via Groq Whisper');
-    const transcript = await transcribeMessage(sock, msg);
-    if (!transcript) {
-      logger.warn({ jid }, 'Transcription returned empty — ignoring audio message');
-      return;
-    }
-    effectiveText = `[Voice message transcription]: ${transcript}`;
-    logger.info({ jid, transcriptLen: transcript.length }, 'Transcription complete');
-  }
-
-  logger.info({ jid, sender: senderName, isGroup }, 'Received message: %s', effectiveText.slice(0, 80));
+  logger.info({ jid, sender: senderName, isGroup }, 'Received message: %s', content.slice(0, 80));
 
   await sock.sendPresenceUpdate('composing', jid);
-  appendHistory(jid, 'user', `${senderName}: ${effectiveText}`);
+  appendHistory(jid, 'user', `${senderName}: ${content}`);
 
-  const prompt = buildPrompt(jid, effectiveText, senderName);
+  const prompt = buildPrompt(jid, content, senderName);
 
   let reply;
   const claudePromise = invokeClaude(prompt);
@@ -362,6 +434,8 @@ async function processMessage(sock, msg) {
     }
   } finally {
     inFlight.delete(claudePromise);
+    // Cleanup temp media files after Claude has processed them
+    for (const f of tempFiles) { try { fs.unlinkSync(f); } catch {} }
   }
 
   appendHistory(jid, 'assistant', reply);
@@ -390,7 +464,7 @@ async function startBridge() {
     auth: state,
     version,
     browser: Browsers.ubuntu('Chrome'),
-    logger: pino({ level: 'warn' }),
+    logger: pino({ level: 'info' }),
     // QR rendered manually via qrcode-terminal in connection.update handler
     markOnlineOnConnect: false,
     // Needed for retry/re-key when group message decryption fails
@@ -422,10 +496,18 @@ async function startBridge() {
     } else if (connection === 'open') {
       waConnected = true;
       logger.info({ jid: sock.user?.id }, 'WhatsApp connected');
+      // Re-announce presence to all groups to restore routing after reconnect
+      sock.groupFetchAllParticipating().then(groups => {
+        const jids = Object.keys(groups);
+        logger.info({ count: jids.length }, 'Subscribing to group presence');
+        return Promise.allSettled(jids.map(jid => sock.presenceSubscribe(jid)));
+      }).catch(err => logger.warn({ err }, 'Group presence subscribe failed'));
     }
   });
 
   sock.ev.on('messages.upsert', ({ messages, type }) => {
+    const groups = messages.filter(m => m.key.remoteJid?.endsWith('@g.us'));
+    if (groups.length) logger.info({ type, jids: groups.map(m => m.key.remoteJid), stubs: groups.map(m => m.messageStubType) }, 'group msg upsert');
     if (type !== 'notify') return;
     for (const msg of messages) {
       try {
