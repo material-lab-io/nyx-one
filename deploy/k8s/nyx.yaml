@@ -31,6 +31,10 @@ spec:
     spec:
       terminationGracePeriodSeconds: 320
       restartPolicy: Always
+      securityContext:
+        runAsUser: 1001
+        runAsGroup: 1001
+        fsGroup: 1001
       containers:
         - name: nyx
           image: nyx-claude:latest

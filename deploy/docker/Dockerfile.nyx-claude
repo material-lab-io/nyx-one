@@ -59,6 +59,11 @@ RUN chmod +x /usr/local/bin/nyx-notes
 COPY deploy/docker/entrypoint-bridge.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
+# Run as non-root — required for --dangerously-skip-permissions
+RUN useradd -m -u 1001 -s /bin/bash nyx \
+    && chown -R nyx:nyx /app
+USER nyx
+
 # Data volume: Baileys creds + conversation history
 # Auth via CLAUDE_CODE_OAUTH_TOKEN env var — no .claude volume needed
 VOLUME ["/data/nyx"]
