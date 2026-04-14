@@ -208,7 +208,8 @@ async function transcribeGroq(buffer, mime) {
   const ext = mimeToExt[mime.split(';')[0].trim()] || 'ogg';
 
   const form = new FormData();
-  form.append('file', new Blob([buffer], { type: mime }), `audio.${ext}`);
+  // Node.js Buffer must be converted to Uint8Array — Blob([Buffer]) breaks undici multipart
+  form.append('file', new Blob([new Uint8Array(buffer)], { type: mime }), `audio.${ext}`);
   form.append('model', STT_MODEL);
 
   const res = await fetch(GROQ_STT_URL, {
