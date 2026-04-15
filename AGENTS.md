@@ -106,6 +106,55 @@ Development documentation goes in AGENTS.md, not README.md.
 
 ---
 
+## TOKEN SAFETY — HARD GATE
+
+> **READ THIS BEFORE ANY TASK INVOLVING AUTH, CREDENTIALS, K8S SECRETS, OR CLAUDE SETUP.**
+
+The `nyx-claude-token` k8s secret holds the Claude OAuth token that authenticates Nyx.
+This token has been accidentally overwritten before with a short-lived access token,
+causing auth failures that lasted until the next manual rotation. These rules prevent recurrence.
+
+### Rules (non-negotiable)
+
+**1. NEVER update `nyx-claude-token` via `kubectl` directly or by editing `nyx-secret.yaml`.**
+
+The token is NOT defined in `nyx-secret.yaml`. The file contains only a comment block explaining
+how to create it. There is no tracked manifest for this secret. That is intentional.
+
+**2. NEVER copy from `~/.claude/.credentials.json`.**
+
+The `accessToken` in that file is a short-lived OAuth access token (~8 hours). Using it will
+cause Nyx auth failures at the next token expiry. It LOOKS like it works — until it doesn't.
+
+**3. The ONLY sanctioned rotation path:**
+
+```bash
+# Step 1: On the operator's host machine
+claude setup-token           # Interactive — generates a long-lived token (~1 year)
+
+# Step 2: Pass it to the rotation script
+deploy/k8s/rotate-nyx-token.sh <token>
+```
+
+The script (`deploy/k8s/rotate-nyx-token.sh`) guards against `.credentials.json` tokens by
+comparing the provided token against the current `accessToken`. It will exit 1 if they match.
+
+**4. Rotation is annual.** If you see auth failures, run the rotation. Do not restart the pod
+without rotating — a restart with an expired token still fails.
+
+**5. NEVER commit token values to git.** The `nyx-claude-token` secret must never appear in any
+tracked file with a real value. CI enforces this: see `.github/workflows/test.yml` (token-safety job).
+
+### Quick reference
+
+| Symptom | Action |
+|---------|--------|
+| Nyx auth failures | Run `claude setup-token` → `deploy/k8s/rotate-nyx-token.sh <token>` |
+| Token in git by mistake | Rotate immediately (token is compromised), then remove from history |
+| "How long until expiry?" | `kubectl get secret nyx-claude-token -n bots -o jsonpath='{.metadata.annotations.token-expires}'` |
+
+---
+
 ## Architecture
 
 ```

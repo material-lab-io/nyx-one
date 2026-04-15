@@ -8,6 +8,16 @@ on:
   workflow_dispatch:
 
 jobs:
+  token-safety:
+    runs-on: ubuntu-latest
+    name: Token safety gate
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for leaked Claude tokens
+        run: scripts/check-token-safety.sh
+
   unit:
     runs-on: ubuntu-latest
 

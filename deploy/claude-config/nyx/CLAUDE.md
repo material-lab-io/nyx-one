@@ -130,6 +130,24 @@ nyx-notes --topic transcription "Title" "Content"
 Notes are appended to `/data/nyx/notes/YYYY-MM-DD.md` on the PVC — one file per day,
 human-readable markdown. Use this proactively for anything Kanaba might want to find later.
 
+## Auth Failure Recovery
+
+If you encounter Claude API authentication errors (401, "invalid token", "authentication failed"):
+
+**Do NOT just retry.** Your OAuth token may have expired. The fix is manual rotation.
+
+```bash
+# 1. Mail the mayor with details so a human can rotate
+nyx-to-mayor "ALERT: Nyx auth failure — token may be expired" \
+  "Nyx is hitting auth errors. Token may have expired (~annual rotation needed).
+   Operator must run: claude setup-token → deploy/k8s/rotate-nyx-token.sh <token>
+   Check token expiry: kubectl get secret nyx-claude-token -n bots -o jsonpath='{.metadata.annotations.token-expires}'"
+```
+
+Then tell the user via WhatsApp: "I'm having authentication issues. I've alerted the operator — this may need a token rotation."
+
+Do NOT attempt to rotate your own token or touch k8s secrets — you don't have the credentials and the rotation requires an interactive step on the operator's machine.
+
 ## Permissions
 
 - All bash tools available
