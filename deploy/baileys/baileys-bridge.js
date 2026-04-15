@@ -59,9 +59,17 @@ const STT_MODEL    = process.env.STT_MODEL || 'whisper-large-v3-turbo';
 // ── Logger ────────────────────────────────────────────────────────────────────
 const logger = pino({ level: process.env.LOG_LEVEL || 'info' });
 
+// ── Startup tracking + health timing constants ────────────────────────────────
+// Ported from OpenClaw (src/gateway/process.ts): tiered startup, zombie detection.
+const STARTUP_TIME_MS     = Date.now();
+const QUICK_CHECK_MS      = 5_000;    // First 5s: quick-starting phase
+const STARTUP_TIMEOUT_MS  = 180_000;  // Up to 180s: starting phase (matches OpenClaw)
+const ZOMBIE_THRESHOLD_MS = 120_000;  // >2min without WA connection = zombie
+
 // ── Shutdown / connection state ───────────────────────────────────────────────
-let shuttingDown = false;
-let waConnected  = false;
+let shuttingDown        = false;
+let waConnected         = false;
+let lastClaudeLatencyMs = null; // Updated after each successful claude invocation
 
 // ── Per-chat message queue ────────────────────────────────────────────────────
 const chatQueues = new Map();
@@ -106,10 +114,51 @@ async function handleClaudeError(err) {
   return `⚠️ Sorry, ran into an error. Please try again.`;
 }
 
+// ── Tiered health state (ported from OpenClaw process.ts) ────────────────────
+//
+// States (adapted from OpenClaw zombie-detection + graduated startup logic):
+//   quick-starting  — first 5s after launch; WA handshake not yet attempted
+//   starting        — 5s–180s; within normal startup window
+//   zombie          — >120s without WA connection; port-not-listening equivalent
+//   connected       — waConnected=true; fully operational
+//   shutting_down   — SIGTERM received; draining in-flight messages
+//
+// HTTP status codes:
+//   200 — connected (healthy)
+//   202 — starting / quick-starting (not yet ready, but expected)
+//   503 — zombie / shutting_down / unexpected not-ready
+function getHealthStatus() {
+  const uptimeMs = Date.now() - STARTUP_TIME_MS;
+
+  if (shuttingDown)  return { state: 'shutting_down',  httpStatus: 503, ok: false };
+  if (waConnected)   return { state: 'connected',       httpStatus: 200, ok: true  };
+
+  // Not connected — classify by age (mirrors OpenClaw's quick-check / full-timeout logic)
+  if (uptimeMs <= QUICK_CHECK_MS)     return { state: 'quick-starting', httpStatus: 202, ok: false };
+  if (uptimeMs <= STARTUP_TIMEOUT_MS) return { state: 'starting',       httpStatus: 202, ok: false };
+
+  // Past full startup window (STARTUP_TIMEOUT_MS) without WA connection = zombie.
+  // (OpenClaw: "process is old > 2min [ZOMBIE_THRESHOLD_MS], treating as zombie")
+  return { state: 'zombie', httpStatus: 503, ok: false };
+}
+
 // ── HTTP health server on :8080 ───────────────────────────────────────────────
 const healthServer = http.createServer((req, res) => {
-  const ok = waConnected && !shuttingDown;
-  res.writeHead(ok ? 200 : 503).end(JSON.stringify({ status: ok ? 'ok' : 'not-ready' }));
+  const { state, httpStatus, ok } = getHealthStatus();
+  const uptimeMs = Date.now() - STARTUP_TIME_MS;
+
+  const body = {
+    status:       state,
+    ok,
+    uptime_ms:    uptimeMs,
+    wa_connected: waConnected,
+    in_flight:    inFlight.size,
+    shutting_down: shuttingDown,
+    ...(lastClaudeLatencyMs !== null && { last_claude_latency_ms: lastClaudeLatencyMs }),
+  };
+
+  res.writeHead(httpStatus, { 'Content-Type': 'application/json' })
+     .end(JSON.stringify(body));
 });
 
 // ── ACL ───────────────────────────────────────────────────────────────────────
@@ -431,10 +480,12 @@ async function processMessage(sock, msg) {
   const prompt = buildPrompt(jid, content, senderName);
 
   let reply;
+  const claudeStart   = Date.now();
   const claudePromise = invokeClaude(prompt);
   inFlight.add(claudePromise);
   try {
     reply = await claudePromise;
+    lastClaudeLatencyMs = Date.now() - claudeStart;
   } catch (err) {
     logger.error({ err }, 'Claude invocation failed');
     const errMsg = err.message + (err.stderr || '');
@@ -558,11 +609,16 @@ if (require.main === module) {
     loadHistory,
     appendHistory,
     transcribeGroq,
+    getHealthStatus,
     chatQueues,
     inFlight,
     AUTH_PATTERNS,
     AGENT_NAME,
     GROQ_STT_URL,
     STT_MODEL,
+    STARTUP_TIME_MS,
+    QUICK_CHECK_MS,
+    STARTUP_TIMEOUT_MS,
+    ZOMBIE_THRESHOLD_MS,
   };
 }
