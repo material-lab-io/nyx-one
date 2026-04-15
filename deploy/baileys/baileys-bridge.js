@@ -28,14 +28,9 @@ const { execFile, spawn } = require('child_process');
 const { randomUUID } = require('crypto');
 const fs = require('fs');
 const http = require('http');
-const https = require('https');
 const path = require('path');
 const pino = require('pino');
 const { transcribeAudio, DEFAULT_GROQ_STT_BASE_URL, DEFAULT_STT_MODEL } = require('./stt');
-
-// Node 22 ships with globalAgent timeout=5000ms which is too aggressive for
-// WhatsApp media CDN downloads from k8s pods. Raise it to 30s.
-https.globalAgent.options.timeout = 30_000;
 
 // ── Config ────────────────────────────────────────────────────────────────────
 const DATA_DIR     = process.env.BRIDGE_DATA_DIR       || process.env.NYX_DATA_DIR      || '/data/nyx';

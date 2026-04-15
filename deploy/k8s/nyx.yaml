@@ -29,6 +29,8 @@ spec:
       labels:
         app: nyx
     spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
       terminationGracePeriodSeconds: 320
       restartPolicy: Always
       securityContext:
