@@ -24,6 +24,7 @@ COPY deploy/baileys/package.json ./
 RUN npm install --omit=dev
 
 COPY deploy/baileys/baileys-bridge.js ./
+COPY deploy/baileys/stt/ ./stt/
 
 # Patch Baileys: use allSettled so fetchProps failure doesn't abort executeInitQueries
 RUN sed -i 's/await Promise\.all(\[fetchProps(), fetchBlocklist(), fetchPrivacySettings()\])/await Promise.allSettled([fetchProps(), fetchBlocklist(), fetchPrivacySettings()])/' \
