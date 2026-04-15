@@ -36,6 +36,7 @@ const { transcribeAudio, DEFAULT_GROQ_STT_BASE_URL, DEFAULT_STT_MODEL } = requir
 const DATA_DIR     = process.env.BRIDGE_DATA_DIR       || process.env.NYX_DATA_DIR      || '/data/nyx';
 const WORKDIR      = process.env.BRIDGE_CLAUDE_WORKDIR || process.env.NYX_CLAUDE_WORKDIR || '/app';
 const CLAUDE_BIN   = process.env.BRIDGE_CLAUDE_BIN     || process.env.NYX_CLAUDE_BIN     || 'claude';
+const CLAUDE_MODEL = process.env.BRIDGE_CLAUDE_MODEL   || 'opus[1m]';
 const MAX_HISTORY  = parseInt(process.env.BRIDGE_MAX_HISTORY || process.env.NYX_MAX_HISTORY || '10', 10);
 const HEALTH_PORT  = parseInt(process.env.BRIDGE_HEALTH_PORT || '8080', 10);
 const AGENT_NAME   = process.env.AGENT_NAME         || 'nyx';
@@ -292,7 +293,7 @@ async function transcribeMessage(sock, msg) {
 // ── Invoke Claude CLI ─────────────────────────────────────────────────────────
 function invokeClaude(prompt) {
   return new Promise((resolve, reject) => {
-    const child = spawn(CLAUDE_BIN, ['-p', prompt, '--output-format', 'text', '--dangerously-skip-permissions', '--max-turns', '15'], {
+    const child = spawn(CLAUDE_BIN, ['-p', prompt, '--model', CLAUDE_MODEL, '--output-format', 'text', '--dangerously-skip-permissions', '--max-turns', '15'], {
       cwd: WORKDIR,
       env: { ...process.env },
       stdio: ['ignore', 'pipe', 'pipe'],
