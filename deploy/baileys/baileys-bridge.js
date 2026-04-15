@@ -30,6 +30,7 @@ const fs = require('fs');
 const http = require('http');
 const path = require('path');
 const pino = require('pino');
+const { transcribeAudio, DEFAULT_GROQ_STT_BASE_URL, DEFAULT_STT_MODEL } = require('./stt');
 
 // ── Config ────────────────────────────────────────────────────────────────────
 const DATA_DIR     = process.env.BRIDGE_DATA_DIR       || process.env.NYX_DATA_DIR      || '/data/nyx';
@@ -52,9 +53,9 @@ const CREDS_DIR   = path.join(DATA_DIR, 'creds');
 const HISTORY_DIR = path.join(DATA_DIR, 'conversations');
 
 // ── Groq STT config ───────────────────────────────────────────────────────────
-const GROQ_API_KEY = process.env.GROQ_API_KEY || '';
-const GROQ_STT_URL = (process.env.GROQ_STT_BASE_URL || 'https://api.groq.com/openai/v1').replace(/\/+$/, '') + '/audio/transcriptions';
-const STT_MODEL    = process.env.STT_MODEL || 'whisper-large-v3-turbo';
+const GROQ_API_KEY      = process.env.GROQ_API_KEY || '';
+const GROQ_STT_BASE_URL = process.env.GROQ_STT_BASE_URL || DEFAULT_GROQ_STT_BASE_URL;
+const STT_MODEL         = process.env.STT_MODEL || DEFAULT_STT_MODEL;
 
 // ── Logger ────────────────────────────────────────────────────────────────────
 const logger = pino({ level: process.env.LOG_LEVEL || 'info' });
@@ -243,53 +244,18 @@ function buildPrompt(chatId, newMessage, senderName) {
 // ── Groq Whisper transcription ────────────────────────────────────────────────
 
 /**
- * Send an audio buffer to Groq Whisper and return the transcript text.
- * Returns null if GROQ_API_KEY is not set or if transcription fails.
- *
- * @param {Buffer} buffer - Raw audio bytes
- * @param {string} mime   - MIME type (e.g. 'audio/ogg', 'audio/mp4')
- * @returns {Promise<string|null>}
- */
-async function transcribeGroq(buffer, mime) {
-  if (!GROQ_API_KEY) {
-    logger.warn('GROQ_API_KEY not set — cannot transcribe audio');
-    return null;
-  }
-
-  // Map MIME → file extension for the multipart filename
-  const mimeToExt = { 'audio/ogg': 'ogg', 'audio/mp4': 'mp4', 'audio/mpeg': 'mp3',
-    'audio/webm': 'webm', 'audio/wav': 'wav', 'audio/x-m4a': 'm4a', 'audio/m4a': 'm4a' };
-  const ext = mimeToExt[mime.split(';')[0].trim()] || 'ogg';
-
-  const form = new FormData();
-  // Node.js Buffer must be converted to Uint8Array — Blob([Buffer]) breaks undici multipart
-  form.append('file', new Blob([new Uint8Array(buffer)], { type: mime }), `audio.${ext}`);
-  form.append('model', STT_MODEL);
-
-  const res = await fetch(GROQ_STT_URL, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${GROQ_API_KEY}` },
-    body: form,
-  });
-
-  if (!res.ok) {
-    const detail = await res.text().catch(() => '');
-    throw new Error(`Groq STT HTTP ${res.status}: ${detail.slice(0, 200)}`);
-  }
-
-  const data = await res.json();
-  return data.text?.trim() || null;
-}
-
-/**
  * Download audio from a Baileys message and transcribe via Groq Whisper.
- * Returns the transcript string, or null on failure.
+ * Returns the transcript string, or null on failure or missing API key.
  *
  * @param {import('@whiskeysockets/baileys').WASocket} sock
  * @param {import('@whiskeysockets/baileys').WAMessage} msg
  * @returns {Promise<string|null>}
  */
 async function transcribeMessage(sock, msg) {
+  if (!GROQ_API_KEY) {
+    logger.warn('GROQ_API_KEY not set — cannot transcribe audio');
+    return null;
+  }
   const maxRetries = 3;
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
@@ -302,7 +268,10 @@ async function transcribeMessage(sock, msg) {
       const mime = msg.message?.pttMessage?.mimetype
         || msg.message?.audioMessage?.mimetype
         || 'audio/ogg';
-      return await transcribeGroq(buffer, mime);
+      const result = await transcribeAudio({
+        buffer, mime, apiKey: GROQ_API_KEY, baseUrl: GROQ_STT_BASE_URL, model: STT_MODEL,
+      });
+      return result.text;
     } catch (err) {
       const isRetryable = err?.code === 'ETIMEDOUT' || err?.code === 'ECONNRESET'
         || err?.code === 'ENOTFOUND' || err?.code === 'UND_ERR_CONNECT_TIMEOUT'
@@ -608,14 +577,11 @@ if (require.main === module) {
     buildPrompt,
     loadHistory,
     appendHistory,
-    transcribeGroq,
     getHealthStatus,
     chatQueues,
     inFlight,
     AUTH_PATTERNS,
     AGENT_NAME,
-    GROQ_STT_URL,
-    STT_MODEL,
     STARTUP_TIME_MS,
     QUICK_CHECK_MS,
     STARTUP_TIMEOUT_MS,

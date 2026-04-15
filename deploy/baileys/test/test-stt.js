@@ -1,13 +1,17 @@
 #!/usr/bin/env node
 'use strict';
 /**
- * test-stt.js — Verifies Groq Whisper transcription in baileys-bridge
+ * test-stt.js — Verifies the modular STT implementation in deploy/baileys/stt/
  *
  * Run: node deploy/baileys/test/test-stt.js
  */
 
-process.env.BRIDGE_DATA_DIR = '/tmp/bridge-test-stt-' + process.pid;
-process.env.LOG_LEVEL       = 'warn';
+process.env.LOG_LEVEL = 'warn';
+
+const { transcribeAudio, DEFAULT_GROQ_STT_BASE_URL, DEFAULT_STT_MODEL } = require('../stt');
+const { mimeToExtension, fetchWithTimeout, normalizeBaseUrl } = require('../stt/utils');
+
+const DEFAULT_STT_URL = `${DEFAULT_GROQ_STT_BASE_URL}/audio/transcriptions`;
 
 let passed = 0;
 let failed = 0;
@@ -22,69 +26,48 @@ function assert(cond, msg) {
   }
 }
 
-// ── Test 1: transcribeGroq returns null when GROQ_API_KEY is unset ─────────────
-async function testNoApiKeyReturnsNull() {
-  console.log('\nTest 1: transcribeGroq returns null when GROQ_API_KEY is not set');
-  delete process.env.GROQ_API_KEY;
-
-  const { transcribeGroq } = require('../baileys-bridge');
-  const result = await transcribeGroq(Buffer.from('fake audio'), 'audio/ogg');
-  assert(result === null, 'returns null without API key');
-}
-
-// ── Test 2: transcribeGroq calls Groq with correct URL and auth header ─────────
-async function testTranscribeGroqCallsCorrectEndpoint() {
-  console.log('\nTest 2: transcribeGroq calls Groq API with correct URL and auth');
-
-  process.env.GROQ_API_KEY = 'test-groq-key-123';
-  // Clear module cache so it picks up the new env var
-  Object.keys(require.cache).forEach(k => { if (k.includes('baileys-bridge')) delete require.cache[k]; });
-
-  const { transcribeGroq, GROQ_STT_URL, STT_MODEL } = require('../baileys-bridge');
+// ── Test 1: transcribeAudio calls correct endpoint and returns trimmed text ────
+async function testTranscribeAudioCallsCorrectEndpoint() {
+  console.log('\nTest 1: transcribeAudio calls Groq API with correct URL and auth');
 
   let capturedUrl = null;
   let capturedHeaders = null;
   let capturedFormData = null;
 
-  // Patch global fetch
   const origFetch = globalThis.fetch;
   globalThis.fetch = async (url, opts) => {
     capturedUrl = url;
     capturedHeaders = opts?.headers || {};
     capturedFormData = opts?.body;
-    // Return a successful mock response
-    return {
-      ok: true,
-      json: async () => ({ text: '  Hello world  ' }),
-    };
+    return { ok: true, json: async () => ({ text: '  Hello world  ' }) };
   };
 
   try {
-    const result = await transcribeGroq(Buffer.from('fake audio bytes'), 'audio/ogg');
+    const result = await transcribeAudio({
+      buffer: Buffer.from('fake audio bytes'),
+      mime: 'audio/ogg',
+      apiKey: 'test-groq-key-123',
+    });
 
-    assert(capturedUrl === GROQ_STT_URL, `called correct URL: ${capturedUrl}`);
+    assert(capturedUrl === DEFAULT_STT_URL, `called correct URL: ${capturedUrl}`);
     assert(capturedHeaders.Authorization === 'Bearer test-groq-key-123', 'sent correct auth header');
     assert(capturedFormData instanceof FormData, 'sent FormData body');
-    assert(result === 'Hello world', `returned trimmed transcript: "${result}"`);
+    assert(result.text === 'Hello world', `returned trimmed transcript: "${result.text}"`);
+    assert(result.model === DEFAULT_STT_MODEL, `returned model: "${result.model}"`);
   } finally {
     globalThis.fetch = origFetch;
   }
 }
 
-// ── Test 3: transcribeGroq uses correct model and extension ───────────────────
-async function testTranscribeGroqModelAndExtension() {
-  console.log('\nTest 3: transcribeGroq sends correct model and file extension');
-
-  process.env.GROQ_API_KEY = 'test-key';
-  Object.keys(require.cache).forEach(k => { if (k.includes('baileys-bridge')) delete require.cache[k]; });
-  const { transcribeGroq, STT_MODEL } = require('../baileys-bridge');
+// ── Test 2: transcribeAudio sends correct model and file extension ─────────────
+async function testTranscribeAudioModelAndExtension() {
+  console.log('\nTest 2: transcribeAudio sends correct model and file extension');
 
   const appendedFields = {};
   let fileName = null;
 
   const origFetch = globalThis.fetch;
   globalThis.fetch = async (url, opts) => {
-    // Inspect the FormData entries
     if (opts?.body instanceof FormData) {
       for (const [key, value] of opts.body.entries()) {
         appendedFields[key] = value;
@@ -95,21 +78,22 @@ async function testTranscribeGroqModelAndExtension() {
   };
 
   try {
-    await transcribeGroq(Buffer.from('audio'), 'audio/mp4');
-    assert(appendedFields.model === STT_MODEL, `model field = "${appendedFields.model}"`);
+    const result = await transcribeAudio({
+      buffer: Buffer.from('audio'),
+      mime: 'audio/mp4',
+      apiKey: 'test-key',
+    });
+    assert(appendedFields.model === DEFAULT_STT_MODEL, `model field = "${appendedFields.model}"`);
     assert(fileName === 'audio.mp4', `file name = "${fileName}"`);
+    assert(result.model === DEFAULT_STT_MODEL, `result.model = "${result.model}"`);
   } finally {
     globalThis.fetch = origFetch;
   }
 }
 
-// ── Test 4: transcribeGroq throws on HTTP error ───────────────────────────────
-async function testTranscribeGroqThrowsOnHttpError() {
-  console.log('\nTest 4: transcribeGroq throws on non-OK HTTP response');
-
-  process.env.GROQ_API_KEY = 'test-key';
-  Object.keys(require.cache).forEach(k => { if (k.includes('baileys-bridge')) delete require.cache[k]; });
-  const { transcribeGroq } = require('../baileys-bridge');
+// ── Test 3: transcribeAudio throws on HTTP error ───────────────────────────────
+async function testTranscribeAudioThrowsOnHttpError() {
+  console.log('\nTest 3: transcribeAudio throws on non-OK HTTP response');
 
   const origFetch = globalThis.fetch;
   globalThis.fetch = async () => ({
@@ -121,7 +105,7 @@ async function testTranscribeGroqThrowsOnHttpError() {
   try {
     let threw = false;
     try {
-      await transcribeGroq(Buffer.from('audio'), 'audio/ogg');
+      await transcribeAudio({ buffer: Buffer.from('audio'), mime: 'audio/ogg', apiKey: 'test-key' });
     } catch (err) {
       threw = true;
       assert(err.message.includes('429'), `error includes status code: "${err.message}"`);
@@ -132,13 +116,9 @@ async function testTranscribeGroqThrowsOnHttpError() {
   }
 }
 
-// ── Test 5: transcribeGroq returns null on empty transcript ───────────────────
-async function testTranscribeGroqReturnsNullOnEmpty() {
-  console.log('\nTest 5: transcribeGroq returns null when response has no text');
-
-  process.env.GROQ_API_KEY = 'test-key';
-  Object.keys(require.cache).forEach(k => { if (k.includes('baileys-bridge')) delete require.cache[k]; });
-  const { transcribeGroq } = require('../baileys-bridge');
+// ── Test 4: transcribeAudio throws on empty transcript ────────────────────────
+async function testTranscribeAudioThrowsOnEmptyTranscript() {
+  console.log('\nTest 4: transcribeAudio throws when response has no text');
 
   const origFetch = globalThis.fetch;
   globalThis.fetch = async () => ({
@@ -147,29 +127,31 @@ async function testTranscribeGroqReturnsNullOnEmpty() {
   });
 
   try {
-    const result = await transcribeGroq(Buffer.from('audio'), 'audio/ogg');
-    assert(result === null, `returns null on whitespace-only transcript: ${JSON.stringify(result)}`);
+    let threw = false;
+    try {
+      await transcribeAudio({ buffer: Buffer.from('audio'), mime: 'audio/ogg', apiKey: 'test-key' });
+    } catch (err) {
+      threw = true;
+      assert(err.message.includes('missing text'), `throws with expected message: "${err.message}"`);
+    }
+    assert(threw, 'throws on whitespace-only transcript');
   } finally {
     globalThis.fetch = origFetch;
   }
 }
 
-// ── Test 6: ogg MIME maps to .ogg extension ───────────────────────────────────
+// ── Test 5: MIME → extension mapping ─────────────────────────────────────────
 async function testMimeExtensionMapping() {
-  console.log('\nTest 6: MIME → extension mapping is correct');
-
-  process.env.GROQ_API_KEY = 'test-key';
-  Object.keys(require.cache).forEach(k => { if (k.includes('baileys-bridge')) delete require.cache[k]; });
-  const { transcribeGroq } = require('../baileys-bridge');
+  console.log('\nTest 5: MIME → extension mapping is correct');
 
   const cases = [
-    ['audio/ogg', 'ogg'],
+    ['audio/ogg',              'ogg'],
     ['audio/ogg; codecs=opus', 'ogg'],
-    ['audio/mp4', 'mp4'],
-    ['audio/mpeg', 'mp3'],
-    ['audio/webm', 'webm'],
-    ['audio/x-m4a', 'm4a'],
-    ['audio/unknown', 'ogg'], // fallback
+    ['audio/mp4',              'mp4'],
+    ['audio/mpeg',             'mp3'],
+    ['audio/webm',             'webm'],
+    ['audio/x-m4a',            'm4a'],
+    ['audio/unknown',          'ogg'], // fallback
   ];
 
   const origFetch = globalThis.fetch;
@@ -183,20 +165,76 @@ async function testMimeExtensionMapping() {
       }
       return { ok: true, json: async () => ({ text: 'hi' }) };
     };
-    await transcribeGroq(Buffer.from('x'), mime);
+    await transcribeAudio({ buffer: Buffer.from('x'), mime, apiKey: 'k' });
     assert(actualFileName === `audio.${expectedExt}`, `${mime} → audio.${expectedExt} (got ${actualFileName})`);
   }
   globalThis.fetch = origFetch;
 }
 
+// ── Test 6: custom baseUrl is used ────────────────────────────────────────────
+async function testCustomBaseUrl() {
+  console.log('\nTest 6: custom baseUrl overrides default Groq endpoint');
+
+  let capturedUrl = null;
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    capturedUrl = url;
+    return { ok: true, json: async () => ({ text: 'ok' }) };
+  };
+
+  try {
+    await transcribeAudio({
+      buffer: Buffer.from('audio'),
+      mime: 'audio/ogg',
+      apiKey: 'k',
+      baseUrl: 'https://custom.provider.com/v1/',
+    });
+    assert(
+      capturedUrl === 'https://custom.provider.com/v1/audio/transcriptions',
+      `custom baseUrl used: ${capturedUrl}`,
+    );
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+}
+
+// ── Test 7: fetchWithTimeout aborts after timeout ─────────────────────────────
+async function testFetchWithTimeout() {
+  console.log('\nTest 7: fetchWithTimeout aborts on timeout');
+
+  let abortSignal = null;
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = async (url, opts) => {
+    abortSignal = opts?.signal;
+    // Simulate a slow response that will be aborted
+    return new Promise((_, reject) => {
+      opts?.signal?.addEventListener('abort', () => reject(new Error('aborted')));
+    });
+  };
+
+  try {
+    let threw = false;
+    try {
+      await fetchWithTimeout('http://example.com', {}, 10); // 10ms timeout
+    } catch {
+      threw = true;
+    }
+    assert(threw, 'fetchWithTimeout throws on timeout');
+    assert(abortSignal instanceof AbortSignal, 'uses AbortController signal');
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+}
+
 (async () => {
   try {
-    await testNoApiKeyReturnsNull();
-    await testTranscribeGroqCallsCorrectEndpoint();
-    await testTranscribeGroqModelAndExtension();
-    await testTranscribeGroqThrowsOnHttpError();
-    await testTranscribeGroqReturnsNullOnEmpty();
+    await testTranscribeAudioCallsCorrectEndpoint();
+    await testTranscribeAudioModelAndExtension();
+    await testTranscribeAudioThrowsOnHttpError();
+    await testTranscribeAudioThrowsOnEmptyTranscript();
     await testMimeExtensionMapping();
+    await testCustomBaseUrl();
+    await testFetchWithTimeout();
   } catch (err) {
     console.error('Unexpected error:', err);
     failed++;
