@@ -241,21 +241,34 @@ async function transcribeGroq(buffer, mime) {
  * @returns {Promise<string|null>}
  */
 async function transcribeMessage(sock, msg) {
-  try {
-    const buffer = await downloadMediaMessage(
-      msg,
-      'buffer',
-      {},
-      { logger, reuploadRequest: sock.updateMediaMessage },
-    );
-    const mime = msg.message?.pttMessage?.mimetype
-      || msg.message?.audioMessage?.mimetype
-      || 'audio/ogg';
-    return await transcribeGroq(buffer, mime);
-  } catch (err) {
-    logger.error({ err }, 'Audio transcription failed');
-    return null;
+  const maxRetries = 3;
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      const buffer = await downloadMediaMessage(
+        msg,
+        'buffer',
+        {},
+        { logger, reuploadRequest: sock.updateMediaMessage },
+      );
+      const mime = msg.message?.pttMessage?.mimetype
+        || msg.message?.audioMessage?.mimetype
+        || 'audio/ogg';
+      return await transcribeGroq(buffer, mime);
+    } catch (err) {
+      const isRetryable = err?.code === 'ETIMEDOUT' || err?.code === 'ECONNRESET'
+        || err?.code === 'ENOTFOUND' || err?.code === 'UND_ERR_CONNECT_TIMEOUT'
+        || (err?.message && /timeout|socket hang up/i.test(err.message));
+      if (isRetryable && attempt < maxRetries) {
+        const delay = attempt * 2000; // 2s, 4s
+        logger.warn({ err: err.code || err.message, attempt, delay }, 'Media download failed, retrying');
+        await new Promise(r => setTimeout(r, delay));
+        continue;
+      }
+      logger.error({ err, attempt }, 'Audio transcription failed');
+      return null;
+    }
   }
+  return null;
 }
 
 // ── Invoke Claude CLI ─────────────────────────────────────────────────────────
