@@ -293,3 +293,26 @@ R2 is mounted via s3fs at `/data/moltbot`. Important gotchas:
 - **Never delete R2 data**: The mount directory `/data/moltbot` IS the R2 bucket. Running `rm -rf /data/moltbot/*` will DELETE your backup data. Always check mount status before any destructive operations.
 
 - **Process status**: The sandbox API's `proc.status` may not update immediately after a process completes. Instead of checking `proc.status === 'completed'`, verify success by checking for expected output (e.g., timestamp file exists after sync).
+
+## Codebase Knowledge Graph (MANDATORY GATE)
+
+Before writing new code, you MUST run `/graphify` to understand existing patterns,
+utilities, and conventions. This is a quality gate — not optional.
+
+```bash
+# First time in a codebase (no graphify-out/graph.json):
+/graphify .
+
+# Subsequent sessions (incremental update):
+/graphify . --update
+
+# Query before implementing:
+/graphify query "<concept related to your task>"
+```
+
+**Why mandatory:** The graph reveals cross-file patterns, shared utilities, and
+architectural decisions invisible from reading individual files. Without it, agents
+reinvent existing code, violate conventions, and introduce inconsistencies.
+
+**If graphify is unavailable:** Note it in your bead and proceed, but flag it so
+the Mayor can investigate.
