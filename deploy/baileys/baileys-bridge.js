@@ -25,6 +25,8 @@
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, isJidGroup, fetchLatestBaileysVersion, Browsers, downloadMediaMessage } = require('@whiskeysockets/baileys');
 const qrcode = require('qrcode-terminal');
 const { execFile, spawn } = require('child_process');
+const { promisify } = require('util');
+const execFileAsync = promisify(execFile);
 const { randomUUID } = require('crypto');
 const fs = require('fs');
 const http = require('http');
@@ -52,6 +54,10 @@ const TMP_DIR = '/app/tmp';
 
 const CREDS_DIR   = path.join(DATA_DIR, 'creds');
 const HISTORY_DIR = path.join(DATA_DIR, 'conversations');
+
+// ── Inbox watcher ingest config ───────────────────────────────────────────────
+const INGEST_TOKEN   = process.env.INGEST_TOKEN   || '';
+const NYX_OWNER_JID  = process.env.NYX_OWNER_JID  || '';
 
 // ── Groq STT config ───────────────────────────────────────────────────────────
 const GROQ_API_KEY      = process.env.GROQ_API_KEY || '';
@@ -90,9 +96,62 @@ function enqueueForChat(chatId, thunk) {
 }
 
 // ── SIGTERM handler (25s drain) ───────────────────────────────────────────────
+// ── Heartbeat: check for due cron jobs every 60s ──────────────────────────
+let heartbeatTimer = null;
+let cleanupCounter = 0;
+let activeSock     = null;
+
+function startHeartbeat(sock) {
+  if (heartbeatTimer) return;
+  heartbeatTimer = setInterval(async () => {
+    if (shuttingDown || !waConnected) return;
+    try {
+      const { stdout } = await execFileAsync('nyx-memory', ['cron', 'due'], { timeout: 10_000 });
+      const jobs = JSON.parse(stdout || '[]');
+      for (const job of jobs) {
+        try {
+          if (job.payload_kind === 'message') {
+            await sock.sendMessage(job.chat_jid, { text: job.payload });
+          } else if (job.payload_kind === 'prompt') {
+            const reply = await invokeClaude(job.payload);
+            if (reply.trim() === 'SKIP') {
+              logger.info({ jobId: job.id }, 'heartbeat skipped due to SKIP marker');
+            } else {
+              await sock.sendMessage(job.chat_jid, { text: reply });
+            }
+          }
+          execFile('nyx-memory', ['cron', 'done', String(job.id), '--status', 'ok']);
+        } catch (err) {
+          logger.error({ err, jobId: job.id }, 'Cron job execution failed');
+          execFile('nyx-memory', ['cron', 'done', String(job.id), '--status', 'error']);
+        }
+      }
+    } catch (err) {
+      if (err.code !== 'ENOENT') logger.warn({ err: err.message }, 'Heartbeat check failed');
+    }
+    // Periodic cleanup every 6 hours (360 ticks at 60s each)
+    cleanupCounter++;
+    if (cleanupCounter >= 360) {
+      cleanupCounter = 0;
+      execFile('nyx-memory', ['cleanup'], { timeout: 10_000 }, (err) => {
+        if (err && err.code !== 'ENOENT') logger.warn({ err: err.message }, 'Periodic cleanup failed');
+        else logger.info('Periodic scratch note cleanup completed');
+      });
+    }
+  }, 60_000);
+}
+
+function stopHeartbeat() {
+  if (heartbeatTimer) {
+    clearInterval(heartbeatTimer);
+    heartbeatTimer = null;
+  }
+}
+
 process.on('SIGTERM', async () => {
   logger.info('SIGTERM received — draining in-flight requests (up to 310s)');
   shuttingDown = true;
+  stopHeartbeat();
   await Promise.race([
     Promise.all([...inFlight]),
     new Promise(r => setTimeout(r, 310000)),
@@ -145,7 +204,98 @@ function getHealthStatus() {
 }
 
 // ── HTTP health server on :8080 ───────────────────────────────────────────────
+// Handles:
+//   GET  /                — health (tiered startup states)
+//   POST /ingest/email    — inbox notification from nyx-gmail-watcher (host-side)
+//                           queues a Claude-judged alert via nyx-memory cron
+function handleIngestEmail(req, res) {
+  if (!INGEST_TOKEN) {
+    res.writeHead(500, { 'Content-Type': 'text/plain' }).end('INGEST_TOKEN not configured');
+    return;
+  }
+  if (req.headers['authorization'] !== `Bearer ${INGEST_TOKEN}`) {
+    res.writeHead(401, { 'Content-Type': 'text/plain' }).end('Unauthorized');
+    return;
+  }
+  if (!NYX_OWNER_JID) {
+    logger.warn('NYX_OWNER_JID unset — cannot schedule inbox alert');
+    res.writeHead(202, { 'Content-Type': 'text/plain' }).end('no owner jid; skipped');
+    return;
+  }
+  let body = '';
+  req.on('data', d => { body += d; if (body.length > 256 * 1024) { req.destroy(); } });
+  req.on('end', () => {
+    let payload;
+    try { payload = JSON.parse(body); }
+    catch (e) { res.writeHead(400, { 'Content-Type': 'text/plain' }).end('bad json'); return; }
+    const { msg_id, from: fromAddr, subject, snippet } = payload;
+    if (!msg_id) {
+      res.writeHead(400, { 'Content-Type': 'text/plain' }).end('msg_id required');
+      return;
+    }
+    const prompt =
+`INBOX NOTIFICATION: A new email arrived in nyx@materiallab.io.
+From:    ${fromAddr || '(unknown)'}
+Subject: ${subject || '(no subject)'}
+Snippet: ${(snippet || '').slice(0, 400)}
+Message ID: ${msg_id}
+
+You can fetch the full email with: nyx-email read ${msg_id}
+
+Decide whether this is important enough to notify Kanaba on WhatsApp RIGHT NOW
+(urgent, financial, legal, from someone he cares about, an email awaiting his
+reply, a ticket/security alert). If YES, reply with a concise WhatsApp
+notification (1-3 short lines; lead with the subject and key ask). If the
+email is promotional, a newsletter, automated/noise, or otherwise low-priority,
+reply with EXACTLY the single word: SKIP`;
+    const jobName = ('inbox-' + msg_id).slice(0, 80);
+    // Schedule 2s from now in UTC ISO-8601 (no fractional seconds / no Z — matches parse_time).
+    // The heartbeat runs every 60s and picks up any job whose next_run_at <= now().
+    const runAt = new Date(Date.now() + 2_000).toISOString().replace(/\.\d+Z$/, '');
+    execFile('nyx-memory', [
+      'cron', 'add',
+      '--name', jobName,
+      '--at', runAt,
+      '--prompt', prompt,
+      '--chat', NYX_OWNER_JID,
+    ], { timeout: 10_000 }, (err, stdout, stderr) => {
+      if (err) logger.error({ err: err.message, stderr: (stderr || '').slice(0, 200) }, 'failed to schedule inbox alert');
+      else logger.info({ jobName, from: (fromAddr || '').slice(0, 60) }, 'scheduled inbox alert');
+    });
+    res.writeHead(202, { 'Content-Type': 'text/plain' }).end('queued');
+  });
+  req.on('error', () => {
+    if (!res.writableEnded) res.writeHead(400, { 'Content-Type': 'text/plain' }).end('bad request');
+  });
+}
+
 const healthServer = http.createServer((req, res) => {
+  if (req.method === 'POST' && req.url === '/ingest/email') {
+    return handleIngestEmail(req, res);
+  }
+
+  // ── Send message endpoint ────────────────────────────────────────────────────
+  if (req.method === 'POST' && req.url === '/send') {
+    if (!waConnected) {
+      res.writeHead(503, { 'Content-Type': 'application/json' }).end(JSON.stringify({ error: 'not connected' }));
+      return;
+    }
+    let body = '';
+    req.on('data', d => { body += d; if (body.length > 64 * 1024) req.destroy(); });
+    req.on('end', async () => {
+      try {
+        const { jid, text } = JSON.parse(body);
+        if (!jid || !text) { res.writeHead(400, { 'Content-Type': 'application/json' }).end(JSON.stringify({ error: 'jid and text required' })); return; }
+        await activeSock.sendMessage(jid, { text });
+        res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify({ status: 'sent', jid }));
+      } catch (e) {
+        res.writeHead(500, { 'Content-Type': 'application/json' }).end(JSON.stringify({ error: e.message }));
+      }
+    });
+    return;
+  }
+
+  // Default: health endpoint
   const { state, httpStatus, ok } = getHealthStatus();
   const uptimeMs = Date.now() - STARTUP_TIME_MS;
 
@@ -293,7 +443,7 @@ async function transcribeMessage(sock, msg) {
 // ── Invoke Claude CLI ─────────────────────────────────────────────────────────
 function invokeClaude(prompt) {
   return new Promise((resolve, reject) => {
-    const child = spawn(CLAUDE_BIN, ['-p', prompt, '--model', CLAUDE_MODEL, '--output-format', 'text', '--dangerously-skip-permissions', '--max-turns', '15'], {
+    const child = spawn(CLAUDE_BIN, ['-p', prompt, '--model', CLAUDE_MODEL, '--output-format', 'text', '--dangerously-skip-permissions', '--max-turns', '100'], {
       cwd: WORKDIR,
       env: { ...process.env },
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -514,6 +664,7 @@ async function startBridge() {
     },
   });
 
+  activeSock = sock;
   sock.ev.on('creds.update', saveCreds);
 
   sock.ev.on('connection.update', ({ connection, lastDisconnect, qr }) => {
@@ -536,6 +687,7 @@ async function startBridge() {
     } else if (connection === 'open') {
       waConnected = true;
       logger.info({ jid: sock.user?.id }, 'WhatsApp connected');
+      startHeartbeat(sock);
       // Re-announce presence to all groups to restore routing after reconnect
       sock.groupFetchAllParticipating().then(groups => {
         const jids = Object.keys(groups);
