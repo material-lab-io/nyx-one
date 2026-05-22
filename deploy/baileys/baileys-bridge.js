@@ -156,6 +156,7 @@ process.on('SIGTERM', async () => {
   logger.info('SIGTERM received — draining in-flight requests (up to 310s)');
   shuttingDown = true;
   stopHeartbeat();
+  stopAuthCheck();
   await Promise.race([
     Promise.all([...inFlight]),
     new Promise(r => setTimeout(r, 310000)),
@@ -177,6 +178,77 @@ async function handleClaudeError(err) {
     return `⚠️ My AI connection is down. Kanaba has been notified.`;
   }
   return `⚠️ Sorry, ran into an error. Please try again.`;
+}
+
+// ── Periodic auth health check + live token swap ─────────────────────────────
+const AUTH_CHECK_INTERVAL_MS = 5 * 60 * 1000;
+const AUTH_PROBE_TIMEOUT_MS  = 10 * 1000;
+let authCheckTimer = null;
+
+function probeClaudeToken(token, label) {
+  return new Promise((resolve) => {
+    const proc = spawn(CLAUDE_BIN, ['-p', 'ping', '--output-format', 'text'], {
+      env: { ...process.env, CLAUDE_CODE_OAUTH_TOKEN: token },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const timer = setTimeout(() => { proc.kill('SIGKILL'); resolve({ ok: false, label, reason: 'timeout' }); }, AUTH_PROBE_TIMEOUT_MS);
+    let err = '';
+    proc.stderr.on('data', d => { err += d.toString(); });
+    proc.on('exit', (code) => {
+      clearTimeout(timer);
+      resolve({ ok: code === 0, label, reason: err.split('\n')[0] || '' });
+    });
+  });
+}
+
+function notifyOwnerOfAuthFailure(r1, r2) {
+  if (!activeSock || !waConnected || !NYX_OWNER_JID) return;
+  const t2 = r2 ? `, token-2=${r2.reason}` : '';
+  const text = `⚠️ nyx auth failing: token-1=${r1.reason}${t2}. Bridge continues with last working token.`;
+  activeSock.sendMessage(NYX_OWNER_JID, { text }).catch(() => {});
+}
+
+async function authHealthCheck() {
+  if (!waConnected || shuttingDown) return;
+  if (process.env.ANTHROPIC_API_KEY) return;
+
+  const primary  = process.env.CLAUDE_CODE_OAUTH_TOKEN || '';
+  const fallback = process.env.CLAUDE_CODE_OAUTH_TOKEN_2 || '';
+  if (!primary) return;
+
+  const r = await probeClaudeToken(primary, 'token-1');
+  if (r.ok) {
+    logger.info({ label: r.label }, 'auth probe healthy');
+    return;
+  }
+
+  logger.warn({ result: r }, 'primary token probe failed; trying fallback');
+  if (!fallback) {
+    logger.error('no CLAUDE_CODE_OAUTH_TOKEN_2 set; cannot swap');
+    notifyOwnerOfAuthFailure(r);
+    return;
+  }
+
+  const r2 = await probeClaudeToken(fallback, 'token-2');
+  if (r2.ok) {
+    process.env.CLAUDE_CODE_OAUTH_TOKEN = fallback;
+    logger.info('auth swap to token-2 succeeded');
+    return;
+  }
+
+  logger.error({ r, r2 }, 'both tokens failed; escalating to owner');
+  notifyOwnerOfAuthFailure(r, r2);
+}
+
+function startAuthCheck() {
+  if (authCheckTimer) return;
+  authCheckTimer = setInterval(() => {
+    authHealthCheck().catch(e => logger.error({ err: e }, 'authHealthCheck threw'));
+  }, AUTH_CHECK_INTERVAL_MS);
+}
+
+function stopAuthCheck() {
+  if (authCheckTimer) { clearInterval(authCheckTimer); authCheckTimer = null; }
 }
 
 // ── Tiered health state (ported from OpenClaw process.ts) ────────────────────
@@ -710,6 +782,7 @@ async function startBridge() {
       waConnected = true;
       logger.info({ jid: sock.user?.id }, 'WhatsApp connected');
       startHeartbeat(sock);
+      startAuthCheck();
       // Re-announce presence to all groups to restore routing after reconnect
       sock.groupFetchAllParticipating().then(groups => {
         const jids = Object.keys(groups);
@@ -756,6 +829,7 @@ if (require.main === module) {
     chatQueues,
     inFlight,
     AUTH_PATTERNS,
+    probeClaudeToken,
     AGENT_NAME,
     STARTUP_TIME_MS,
     QUICK_CHECK_MS,
