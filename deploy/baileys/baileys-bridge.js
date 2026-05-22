@@ -55,6 +55,10 @@ const TMP_DIR = '/app/tmp';
 const CREDS_DIR   = path.join(DATA_DIR, 'creds');
 const HISTORY_DIR = path.join(DATA_DIR, 'conversations');
 
+// Phone number pairing: if set, request a pairing code instead of showing QR.
+// Format: digits only, with country code, no + (e.g. "919187520828").
+const PAIRING_PHONE = process.env.BRIDGE_PAIRING_PHONE || '';
+
 // ── Inbox watcher ingest config ───────────────────────────────────────────────
 const INGEST_TOKEN   = process.env.INGEST_TOKEN   || '';
 const NYX_OWNER_JID  = process.env.NYX_OWNER_JID  || '';
@@ -655,9 +659,8 @@ async function startBridge() {
     version,
     browser: Browsers.ubuntu('Chrome'),
     logger: pino({ level: 'info' }),
-    // QR rendered manually via qrcode-terminal in connection.update handler
     markOnlineOnConnect: false,
-    // Needed for retry/re-key when group message decryption fails
+    usePairingCode: !!PAIRING_PHONE,
     getMessage: async (key) => {
       logger.debug({ key }, 'getMessage called (retry/re-key request)');
       return { conversation: '' };
@@ -667,8 +670,26 @@ async function startBridge() {
   activeSock = sock;
   sock.ev.on('creds.update', saveCreds);
 
+  // Request pairing code with retry — WS needs to be open before the call succeeds.
+  if (PAIRING_PHONE && !state.creds.registered) {
+    const phone = PAIRING_PHONE.replace(/\D/g, '');
+    const requestWithRetry = (attempt = 0) => {
+      sock.requestPairingCode(phone).then(code => {
+        logger.info(`PAIRING CODE: ${code}`);
+        process.stdout.write(`\n\n>>> WhatsApp pairing code for ${phone}: ${code} <<<\n\n`);
+      }).catch(err => {
+        if (attempt < 8) {
+          setTimeout(() => requestWithRetry(attempt + 1), 1000 * (attempt + 1));
+        } else {
+          logger.error({ err }, 'Failed to get pairing code after retries');
+        }
+      });
+    };
+    setTimeout(() => requestWithRetry(), 500);
+  }
+
   sock.ev.on('connection.update', ({ connection, lastDisconnect, qr }) => {
-    if (qr) {
+    if (qr && !PAIRING_PHONE) {
       logger.info('QR code generated — scan with charlie account');
       qrcode.generate(qr, { small: true });
     }
