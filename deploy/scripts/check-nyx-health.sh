@@ -14,6 +14,7 @@ CONSECUTIVE_UNHEALTHY_THRESHOLD=3
 GT_DIR="${HOME}/gt"
 MAYOR_BRIDGE_TOKEN_FILE="${HOME}/.config/gt/mayor-bridge-token"
 MAYOR_BRIDGE_CANONICAL="/home/kanaba/gt/nyx_one/crew/nyx/deploy/mayor-bridge/mayor-bridge.js"
+CANARY_CONFIG="${HOME}/.config/gt/nyx-health-canary.json"
 STALE_DAYS=7
 
 log() { echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*"; }
@@ -262,10 +263,101 @@ check_mayor_bridge() {
   log "mayor-bridge healthy"
 }
 
+# ── Pod-side end-to-end smoke test ────────────────────────────────────────────
+
+check_pod_e2e() {
+  if [ ! -f "$CANARY_CONFIG" ]; then
+    log "pod-e2e: canary config not found at $CANARY_CONFIG — skipping"
+    return
+  fi
+
+  if ! command -v kubectl &>/dev/null || ! kubectl cluster-info &>/dev/null 2>&1; then
+    log "pod-e2e: kubectl unavailable — skipping"
+    return
+  fi
+
+  local pod_name
+  pod_name=$(kubectl get pods -n "$NAMESPACE" -l "$APP_LABEL" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+  if [ -z "$pod_name" ]; then
+    log "pod-e2e: no nyx pod — skipping (already escalated in pod checks)"
+    return
+  fi
+
+  local canary_folder min_files
+  canary_folder=$(jq -r '.drive_folder_id' "$CANARY_CONFIG" 2>/dev/null)
+  min_files=$(jq -r '.min_expected_files // 1' "$CANARY_CONFIG" 2>/dev/null)
+  if [ -z "$canary_folder" ] || [ "$canary_folder" = "null" ]; then
+    log "pod-e2e: no drive_folder_id in canary config — skipping"
+    return
+  fi
+
+  log "--- pod-side e2e checks ---"
+
+  # Drive smoke test from inside the pod using query path (validates routing fix too)
+  local drive_out drive_exit
+  drive_out=$(kubectl exec -n "$NAMESPACE" "$pod_name" -- \
+    nyx-drive list --query "'${canary_folder}' in parents" --max "$min_files" 2>&1) || true
+  drive_exit=$?
+
+  # Parse result
+  if [ $drive_exit -ne 0 ] && echo "$drive_out" | grep -qi "connection refused\|command not found\|unable to connect"; then
+    log "pod-e2e: drive unreachable from pod"
+    do_escalate HIGH \
+      "mayor-bridge: unreachable from pod (nyx-drive exit=$drive_exit)" \
+      "mayor-bridge-pod-unreachable"
+    return
+  fi
+
+  if echo "$drive_out" | grep -qi "unauthorized\|401\|Forbidden\|403\|invalid.*token"; then
+    log "pod-e2e: pod token rejected"
+    do_escalate HIGH \
+      "mayor-bridge: pod token rejected — k8s secret drift? (pod=$pod_name)" \
+      "mayor-bridge-pod-token"
+    return
+  fi
+
+  # Check if files were returned
+  local file_count=0
+  if echo "$drive_out" | jq -e '.exit_code' &>/dev/null; then
+    local inner_exit
+    inner_exit=$(echo "$drive_out" | jq -r '.exit_code // 1')
+    local stderr_out
+    stderr_out=$(echo "$drive_out" | jq -r '.stderr // ""')
+
+    if [ "$inner_exit" != "0" ]; then
+      if echo "$stderr_out" | grep -qi "unauthorized\|401\|invalid.*token"; then
+        log "pod-e2e: pod token rejected (inner exit=$inner_exit)"
+        do_escalate HIGH \
+          "mayor-bridge: pod token rejected — k8s secret drift? (pod=$pod_name, stderr=${stderr_out:0:100})" \
+          "mayor-bridge-pod-token"
+        return
+      fi
+      log "pod-e2e: nyx-drive returned exit_code=$inner_exit"
+      do_escalate HIGH \
+        "mayor-bridge: unreachable from pod (inner exit=$inner_exit, stderr=${stderr_out:0:100})" \
+        "mayor-bridge-pod-unreachable"
+      return
+    fi
+
+    file_count=$(echo "$drive_out" | jq -r '.stdout' 2>/dev/null | jq '.files | length' 2>/dev/null || echo "0")
+  fi
+
+  if [ "$file_count" -lt "$min_files" ]; then
+    log "pod-e2e: shared content invisible (got $file_count files, expected >= $min_files)"
+    do_escalate HIGH \
+      "mayor-bridge: shared-content invisible — query routing broken? (pod=$pod_name, folder=$canary_folder, files=$file_count)" \
+      "mayor-bridge-shared-content"
+    return
+  fi
+
+  log "pod-e2e drive OK (files=$file_count)"
+}
+
 # ── Run all checks ───────────────────────────────────────────────────────────
 
 check_nyx_pod
 check_mayor_bridge
+check_pod_e2e
 
 # Summary
 nyx_healthy=true
@@ -297,5 +389,10 @@ if [ "${1:-}" = "--install" ]; then
   if [ ! -f "$MAYOR_BRIDGE_TOKEN_FILE" ]; then
     log "--install: NOTE — mayor-bridge smoke test requires token at $MAYOR_BRIDGE_TOKEN_FILE"
     log "  Run: mkdir -p ~/.config/gt && sudo grep '^MAYOR_BRIDGE_TOKEN=' /data/mayor-bridge/secrets.env | cut -d= -f2- > ~/.config/gt/mayor-bridge-token && chmod 600 ~/.config/gt/mayor-bridge-token"
+  fi
+  # Canary config reminder
+  if [ ! -f "$CANARY_CONFIG" ]; then
+    log "--install: NOTE — pod-side e2e probe requires canary config at $CANARY_CONFIG"
+    log '  Run: echo '\''{ "drive_folder_id": "<FOLDER_ID>", "min_expected_files": 1 }'\'' > ~/.config/gt/nyx-health-canary.json && chmod 600 ~/.config/gt/nyx-health-canary.json'
   fi
 fi
