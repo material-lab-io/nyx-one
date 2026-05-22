@@ -702,7 +702,8 @@ async function startBridge() {
         logger.info('Reconnecting in 5s...');
         setTimeout(startBridge, 5000);
       } else if (loggedOut) {
-        logger.error('Logged out — delete creds and restart to re-link');
+        logger.error({ credsDir: CREDS_DIR }, 'Logged out — wiping creds to force fresh re-pair on next start');
+        try { fs.rmSync(CREDS_DIR, { recursive: true, force: true }); } catch (e) { logger.error({ err: e }, 'failed to wipe creds dir'); }
         process.exit(1);
       }
     } else if (connection === 'open') {
