@@ -1,0 +1,165 @@
+#!/bin/bash
+# nyx-drive — Google Drive ops for nyx@materiallab.io via mayor-bridge.
+#
+# Usage:
+#   nyx-drive upload /path/to/file [--name "Pretty name"] [--folder "Contracts"] [--folder-id ID]
+#   nyx-drive list [--query Q] [--folder-id ID] [--max 20]
+#   nyx-drive search "Q3 report" [--max 20]
+#   nyx-drive download <file_id> <out_path>
+#   nyx-drive share <file_id> <email> [--role reader|writer|editor]
+#
+# Requires: MAYOR_BRIDGE_URL, MAYOR_BRIDGE_TOKEN in env.
+
+set -euo pipefail
+
+: "${MAYOR_BRIDGE_URL:?MAYOR_BRIDGE_URL not set}"
+: "${MAYOR_BRIDGE_TOKEN:?MAYOR_BRIDGE_TOKEN not set}"
+
+SUB="${1:-}"
+shift || true
+
+usage() {
+  cat >&2 <<'EOF'
+Usage:
+  nyx-drive upload /path/to/file [--name NAME] [--folder NAME] [--folder-id ID]
+  nyx-drive list [--query Q] [--folder-id ID] [--max 20]
+  nyx-drive search "Q3 report" [--max 20]
+  nyx-drive download <file_id> <out_path>
+  nyx-drive share <file_id> <email> [--role reader|writer|editor]
+EOF
+}
+
+SRC=""; NAME=""; FOLDER=""; FOLDER_ID=""; QUERY=""; MAX=""; FILE_ID=""; OUT_PATH=""; EMAIL=""; ROLE=""
+
+case "$SUB" in
+  upload)
+    SRC="${1:-}"
+    [ -n "$SRC" ] || { echo "Usage: nyx-drive upload <path> [--name NAME] [--folder NAME]" >&2; exit 1; }
+    shift
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --name)      NAME="$2"; shift 2;;
+        --folder)    FOLDER="$2"; shift 2;;
+        --folder-id) FOLDER_ID="$2"; shift 2;;
+        -h|--help)   usage; exit 0;;
+        *) echo "Unknown flag: $1" >&2; exit 1;;
+      esac
+    done
+    [ -f "$SRC" ] || { echo "File not found: $SRC" >&2; exit 1; }
+    [ -n "$NAME" ] || NAME="$(basename "$SRC")"
+    ENDPOINT="/drive/upload"
+    ;;
+  list|search)
+    if [ "$SUB" = "search" ]; then
+      QUERY="${1:-}"
+      [ -n "$QUERY" ] || { echo "Usage: nyx-drive search <query>" >&2; exit 1; }
+      shift
+    fi
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --query)     QUERY="$2"; shift 2;;
+        --folder-id) FOLDER_ID="$2"; shift 2;;
+        --max)       MAX="$2"; shift 2;;
+        -h|--help)   usage; exit 0;;
+        *) echo "Unknown flag: $1" >&2; exit 1;;
+      esac
+    done
+    ENDPOINT="/drive/list"
+    ;;
+  download)
+    FILE_ID="${1:-}"
+    OUT_PATH="${2:-}"
+    [ -n "$FILE_ID" ] && [ -n "$OUT_PATH" ] || { echo "Usage: nyx-drive download <file_id> <out_path>" >&2; exit 1; }
+    ENDPOINT="/drive/download"
+    ;;
+  share)
+    FILE_ID="${1:-}"
+    EMAIL="${2:-}"
+    [ -n "$FILE_ID" ] && [ -n "$EMAIL" ] || { echo "Usage: nyx-drive share <file_id> <email> [--role R]" >&2; exit 1; }
+    shift 2
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --role) ROLE="$2"; shift 2;;
+        -h|--help) usage; exit 0;;
+        *) echo "Unknown flag: $1" >&2; exit 1;;
+      esac
+    done
+    ENDPOINT="/drive/share"
+    ;;
+  ""|-h|--help|help) usage; exit 0;;
+  *) echo "Unknown subcommand: $SUB" >&2; usage; exit 1;;
+esac
+
+export SUB ENDPOINT SRC NAME FOLDER FOLDER_ID QUERY MAX FILE_ID OUT_PATH EMAIL ROLE MAYOR_BRIDGE_URL MAYOR_BRIDGE_TOKEN
+
+exec node <<'NODE'
+'use strict';
+const fs = require('fs');
+const path = require('path');
+const { URL } = require('url');
+
+const sub      = process.env.SUB || '';
+const endpoint = process.env.ENDPOINT;
+const base     = process.env.MAYOR_BRIDGE_URL;
+const token    = process.env.MAYOR_BRIDGE_TOKEN;
+
+const payload = {};
+if (sub === 'upload') {
+  const src = process.env.SRC;
+  if (!fs.existsSync(src)) { process.stderr.write(`file not found: ${src}\n`); process.exit(1); }
+  payload.filename        = process.env.NAME || path.basename(src);
+  payload.content_base64  = fs.readFileSync(src).toString('base64');
+  if (process.env.FOLDER_ID) payload.parent_folder_id = process.env.FOLDER_ID;
+  else if (process.env.FOLDER) payload.parent_folder_name = process.env.FOLDER;
+} else if (sub === 'list' || sub === 'search') {
+  if (process.env.FOLDER_ID) payload.parent = process.env.FOLDER_ID;
+  if (process.env.QUERY) payload.query = process.env.QUERY;
+  if (process.env.MAX)   payload.max = parseInt(process.env.MAX, 10);
+} else if (sub === 'download') {
+  payload.file_id = process.env.FILE_ID;
+} else if (sub === 'share') {
+  payload.file_id = process.env.FILE_ID;
+  payload.email   = process.env.EMAIL;
+  if (process.env.ROLE) payload.role = process.env.ROLE;
+}
+
+const body = JSON.stringify(payload);
+const url = new URL(base + endpoint);
+const http = require(url.protocol === 'https:' ? 'https' : 'http');
+const req = http.request({
+  hostname: url.hostname,
+  port:     url.port || (url.protocol === 'https:' ? 443 : 80),
+  path:     url.pathname,
+  method:   'POST',
+  headers: {
+    'Content-Type':   'application/json',
+    'Authorization':  'Bearer ' + token,
+    'Content-Length': Buffer.byteLength(body),
+  },
+}, res => {
+  let chunks = [];
+  res.on('data', d => chunks.push(d));
+  res.on('end', () => {
+    const raw = Buffer.concat(chunks).toString('utf8');
+    // For download: parse JSON and write file to OUT_PATH, print metadata
+    if (sub === 'download' && res.statusCode >= 200 && res.statusCode < 300) {
+      try {
+        const j = JSON.parse(raw);
+        const outPath = process.env.OUT_PATH;
+        fs.writeFileSync(outPath, Buffer.from(j.content_base64, 'base64'));
+        process.stdout.write(JSON.stringify({ name: j.name, size: j.size, path: outPath }) + '\n');
+        process.exit(0);
+      } catch (e) {
+        process.stderr.write('download parse failed: ' + e.message + '\n');
+        process.exit(1);
+      }
+    }
+    process.stdout.write(raw);
+    if (raw && !raw.endsWith('\n')) process.stdout.write('\n');
+    process.exit(res.statusCode >= 200 && res.statusCode < 300 ? 0 : 1);
+  });
+});
+req.on('error', e => { process.stderr.write('request failed: ' + e.message + '\n'); process.exit(1); });
+req.write(body);
+req.end();
+NODE
