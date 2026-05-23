@@ -2,7 +2,7 @@
 # nyx-to-linear — Create a Linear ticket from Nyx
 #
 # Usage:
-#   nyx-to-linear "title" "description" [--priority 1-4]
+#   nyx-to-linear "title" "description" [--priority 1-4] [--attach /path/to/image ...]
 #
 # Environment:
 #   LINEAR_API_KEY  - Required (from k8s secret nyx-secrets)
@@ -10,15 +10,20 @@
 
 set -euo pipefail
 
-TITLE="${1:?Usage: nyx-to-linear \"title\" \"description\" [--priority 1-4]}"
-DESCRIPTION="${2:?Usage: nyx-to-linear \"title\" \"description\" [--priority 1-4]}"
+TITLE="${1:?Usage: nyx-to-linear \"title\" \"description\" [--priority 1-4] [--attach path ...]}"
+DESCRIPTION="${2:?Usage: nyx-to-linear \"title\" \"description\" [--priority 1-4] [--attach path ...]}"
 PRIORITY=""
+ATTACHMENTS=()
 
 shift 2
 while [ $# -gt 0 ]; do
   case "$1" in
     --priority)
       PRIORITY="${2:?--priority requires a value (1-4)}"
+      shift 2
+      ;;
+    --attach)
+      ATTACHMENTS+=("${2:?--attach requires a file path}")
       shift 2
       ;;
     *)
@@ -31,6 +36,111 @@ done
 if [ -z "${LINEAR_API_KEY:-}" ]; then
   echo "Error: LINEAR_API_KEY not set" >&2
   exit 1
+fi
+
+# Upload attachments via node (pod has node but not jq)
+if [ ${#ATTACHMENTS[@]} -gt 0 ]; then
+  ATTACH_JSON="["
+  for p in "${ATTACHMENTS[@]}"; do
+    [ -f "$p" ] || { echo "Warning: attachment not found: $p" >&2; continue; }
+    ATTACH_JSON="${ATTACH_JSON}\"${p}\","
+  done
+  ATTACH_JSON="${ATTACH_JSON%,}]"
+
+  UPLOAD_RESULT=$(LINEAR_API_KEY="$LINEAR_API_KEY" ATTACH_PATHS="$ATTACH_JSON" node <<'NODE'
+const fs = require('fs');
+const https = require('https');
+const http = require('http');
+const path = require('path');
+
+const LINEAR_API = 'https://api.linear.app/graphql';
+const apiKey = process.env.LINEAR_API_KEY;
+const paths = JSON.parse(process.env.ATTACH_PATHS);
+
+function contentType(f) {
+  const ext = path.extname(f).toLowerCase();
+  const map = {'.jpg':'image/jpeg','.jpeg':'image/jpeg','.png':'image/png','.gif':'image/gif','.webp':'image/webp','.pdf':'application/pdf','.svg':'image/svg+xml'};
+  return map[ext] || 'application/octet-stream';
+}
+
+function graphql(query, variables) {
+  return new Promise((resolve, reject) => {
+    const body = JSON.stringify({ query, variables });
+    const url = new URL(LINEAR_API);
+    const req = https.request({
+      hostname: url.hostname, path: url.pathname, method: 'POST',
+      headers: { 'Authorization': apiKey, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }
+    }, res => {
+      let data = '';
+      res.on('data', d => data += d);
+      res.on('end', () => { try { resolve(JSON.parse(data)); } catch(e) { reject(e); } });
+    });
+    req.on('error', reject);
+    req.write(body);
+    req.end();
+  });
+}
+
+function putFile(uploadUrl, filePath, ct, headers) {
+  return new Promise((resolve, reject) => {
+    const fileData = fs.readFileSync(filePath);
+    const url = new URL(uploadUrl);
+    const mod = url.protocol === 'https:' ? https : http;
+    const hdrs = { 'Content-Type': ct, 'Content-Length': fileData.length };
+    for (const h of headers) hdrs[h.key] = h.value;
+    const req = mod.request({
+      hostname: url.hostname, port: url.port, path: url.pathname + url.search,
+      method: 'PUT', headers: hdrs
+    }, res => {
+      let data = '';
+      res.on('data', d => data += d);
+      res.on('end', () => resolve(res.statusCode));
+    });
+    req.on('error', reject);
+    req.write(fileData);
+    req.end();
+  });
+}
+
+(async () => {
+  const results = [];
+  for (const fp of paths) {
+    try {
+      const filename = path.basename(fp);
+      const ct = contentType(fp);
+      const size = fs.statSync(fp).size;
+      const query = 'mutation($filename:String!,$contentType:String!,$size:Int!){fileUpload(filename:$filename,contentType:$contentType,size:$size){success uploadFile{uploadUrl assetUrl headers{key value}}}}';
+      const resp = await graphql(query, { filename, contentType: ct, size });
+      if (!resp.data?.fileUpload?.success) {
+        process.stderr.write(`fileUpload failed for ${filename}: ${JSON.stringify(resp.errors || resp.data)}\n`);
+        continue;
+      }
+      const { uploadUrl, assetUrl, headers } = resp.data.fileUpload.uploadFile;
+      const status = await putFile(uploadUrl, fp, ct, headers || []);
+      if (status >= 200 && status < 300) {
+        results.push({ filename, assetUrl });
+      } else {
+        process.stderr.write(`PUT failed for ${filename}: HTTP ${status}\n`);
+      }
+    } catch (e) {
+      process.stderr.write(`upload error for ${fp}: ${e.message}\n`);
+    }
+  }
+  process.stdout.write(JSON.stringify(results));
+})();
+NODE
+  ) || UPLOAD_RESULT="[]"
+
+  # Append markdown images to description
+  if [ -n "$UPLOAD_RESULT" ] && [ "$UPLOAD_RESULT" != "[]" ]; then
+    MARKDOWN_IMGS=$(echo "$UPLOAD_RESULT" | node -e "
+      const r = JSON.parse(require('fs').readFileSync('/dev/stdin','utf8'));
+      r.forEach(i => console.log('\n![' + i.filename + '](' + i.assetUrl + ')'));
+    ") || true
+    if [ -n "$MARKDOWN_IMGS" ]; then
+      DESCRIPTION="${DESCRIPTION}${MARKDOWN_IMGS}"
+    fi
+  fi
 fi
 
 ARGS=("create" "$TITLE" "--description" "$DESCRIPTION")

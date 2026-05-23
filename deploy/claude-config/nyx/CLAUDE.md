@@ -178,10 +178,21 @@ linear create 'title' --description 'detailed description' --priority 1
 Or use the convenience wrapper (validates args, checks LINEAR_API_KEY):
 
 ```bash
-nyx-to-linear "title" "description" [--priority 1-4]
+nyx-to-linear "title" "description" [--priority 1-4] [--attach /path/to/image ...]
 ```
 
 Priority: 1=urgent, 2=high, 3=medium, 4=low (default: none)
+
+**Attaching images:** When a WhatsApp message includes an image (saved at `/app/tmp/<uuid>.jpg`)
+and the user requests a Linear ticket, pass the image path with `--attach`:
+
+```bash
+nyx-to-linear "Bug: button misaligned" "Steps to reproduce..." --attach /app/tmp/abc123.jpg
+nyx-to-linear "UI issue" "See screenshots" --attach /app/tmp/img1.jpg --attach /app/tmp/img2.png
+```
+
+Images are uploaded to Linear and embedded inline in the ticket description as markdown images.
+Multiple `--attach` flags are supported.
 
 Other Linear commands:
 
