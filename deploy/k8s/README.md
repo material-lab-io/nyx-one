@@ -103,3 +103,107 @@ Must match `MAYOR_BRIDGE_TOKEN` in `/data/mayor-bridge/secrets.env` on the host.
 - **PVC at `/data/nyx`** — Baileys creds + conversation history survive pod restarts.
 - **Claude auth via `CLAUDE_CODE_OAUTH_TOKEN`** — injected from `nyx-claude-token` secret. NOT from `credentials.json`.
 - **Mayor bridge** — runs on the host as a systemd service, not inside the container.
+
+---
+
+## Imperative deploy state (apply after `nyx.yaml`)
+
+`nyx.yaml` deploys the bare pod + PVC + env vars. The live deployment additionally has
+**five configMaps** and an extended set of **volumes / volumeMounts** that were created
+imperatively and are not yet captured in the manifest. Until they are, run these after
+any `kubectl apply -f nyx.yaml` to restore parity with prod:
+
+```bash
+# 1. ConfigMaps that back the live subPath mounts (built from this repo)
+cd <repo-root>
+kubectl create configmap nyx-bridge-code -n bots \
+  --from-file=baileys-bridge.js=deploy/baileys/baileys-bridge.js \
+  --dry-run=client -o yaml | kubectl apply -f -
+
+kubectl create configmap nyx-to-linear-code -n bots \
+  --from-file=nyx-to-linear=deploy/mayor-bridge/nyx-to-linear \
+  --dry-run=client -o yaml | kubectl apply -f -
+
+kubectl create configmap nyx-store-code -n bots \
+  --from-file=nyx-store=deploy/mayor-bridge/nyx-store \
+  --dry-run=client -o yaml | kubectl apply -f -
+
+kubectl create configmap nyx-files-code -n bots \
+  --from-file=nyx-files=deploy/mayor-bridge/nyx-files \
+  --dry-run=client -o yaml | kubectl apply -f -
+
+kubectl create configmap nyx-claude-md -n bots \
+  --from-file=CLAUDE.md=deploy/claude-config/nyx/CLAUDE.md \
+  --dry-run=client -o yaml | kubectl apply -f -
+
+# 2. Patch the deployment with the configMap volumes + mounts the live pod has
+kubectl -n bots patch deployment nyx --type=strategic -p '{
+  "spec": {"template": {"spec": {
+    "containers": [{
+      "name": "nyx",
+      "volumeMounts": [
+        {"name": "bridge-code",        "mountPath": "/app/baileys-bridge.js",      "subPath": "baileys-bridge.js"},
+        {"name": "nyx-to-linear-code", "mountPath": "/usr/local/bin/nyx-to-linear","subPath": "nyx-to-linear"},
+        {"name": "nyx-store-code",     "mountPath": "/usr/local/bin/nyx-store",    "subPath": "nyx-store"},
+        {"name": "nyx-files-code",     "mountPath": "/usr/local/bin/nyx-files",    "subPath": "nyx-files"},
+        {"name": "claude-md",          "mountPath": "/app/CLAUDE.md",              "subPath": "CLAUDE.md"}
+      ]
+    }],
+    "volumes": [
+      {"name": "bridge-code",        "configMap": {"name": "nyx-bridge-code",    "defaultMode": 420}},
+      {"name": "nyx-to-linear-code", "configMap": {"name": "nyx-to-linear-code", "defaultMode": 493}},
+      {"name": "nyx-store-code",     "configMap": {"name": "nyx-store-code",     "defaultMode": 493}},
+      {"name": "nyx-files-code",     "configMap": {"name": "nyx-files-code",     "defaultMode": 493}},
+      {"name": "claude-md",          "configMap": {"name": "nyx-claude-md",      "defaultMode": 420}}
+    ]
+  }}}
+}'
+
+# 3. Memory headroom for buffering ≤ 100 MB media uploads
+kubectl -n bots set resources deployment/nyx \
+  --limits=memory=2Gi --requests=memory=512Mi
+```
+
+### Building & loading the image (this node has no `nerdctl`)
+
+`docker build` writes to docker's own image store; the kubelet (containerd CRI) does
+**not** see those tags. To make a freshly built image available to the pod:
+
+```bash
+docker build --provenance=false --sbom=false \
+  -t nyx-claude:latest -f deploy/docker/Dockerfile.nyx-claude .
+docker save -o /tmp/nyx-claude.tar nyx-claude:latest
+sudo ctr -n k8s.io images import /tmp/nyx-claude.tar
+rm /tmp/nyx-claude.tar
+kubectl -n bots rollout restart deployment/nyx
+```
+
+The `--provenance=false --sbom=false` flags matter — without them buildkit emits an OCI
+index that `ctr import` mangles into a `"nyx claude"` tag (with a space) and CRI keeps
+the old `:latest`.
+
+## Deferred resilience work (tracked here so it isn't forgotten)
+
+These gaps mean a totally fresh cluster + machine cannot rebuild nyx from this repo
+alone without the steps above (and some human inputs). Worth automating later:
+
+- **ConfigMaps → repo manifests** — capture the five configMaps as YAML so they're
+  GitOps-managed instead of imperative.
+- **`nyx.yaml` reconciliation** — fold the volumes / mounts / 2Gi memory back into the
+  manifest so the WARNING comment can be removed and `kubectl apply` is non-destructive.
+- **WhatsApp creds backup** — `backup-wa-creds.sh` runs by hand; the
+  `nyx-wa-creds-backup` secret on this cluster is stale by weeks. Re-pairing requires
+  Kanaba's phone, so this is the hardest-to-recover datum on the system. Add a CronJob.
+- **PVC backup** — `/data/nyx/` (Baileys creds, conversations, memory vault, files.db)
+  has no ongoing backup. `files.db` (dropbox index) is rebuildable from Drive +
+  storagebox listings; the memory vault is not.
+- **Secrets bootstrap docs** — no `env.example` for the eight `nyx-secrets` keys or for
+  the host-side `mayor-bridge` `secrets.env` (keys observed: `MAYOR_BRIDGE_TOKEN`,
+  `INGEST_TOKEN`, `NYX_BRIDGE_URL`, `GCP_PROJECT`, `GMAIL_SUBSCRIPTION`,
+  `GMAIL_PUBSUB_TOPIC`, `GOG_KEYRING_PASSWORD`).
+- **`nyx-gmail-watcher.service` not installed** on the GT2 host — the unit file is
+  committed under `deploy/mayor-bridge/` but `systemctl` doesn't know about it; install
+  + enable to actually deliver inbox alerts.
+- **Sibling checkouts** — `nyx_one/mayor/rig` (1 file) and `nyx_one/refinery/rig`
+  (5 files) have their own divergent uncommitted state. They are not the deployment
+  source (which is `crew/nyx`) but worth a separate sweep.

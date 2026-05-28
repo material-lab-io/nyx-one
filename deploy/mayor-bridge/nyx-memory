@@ -1,0 +1,737 @@
+#!/bin/bash
+# nyx-memory — Persistent memory (scratch + wiki) and cron/reminders for Nyx
+#
+# Memory tiers:
+#   Scratch: SQLite FTS5 — quick notes with TTL (default 14 days)
+#   Wiki:    Markdown vault — permanent knowledge (people, decisions, learnings)
+#
+# Cron/Reminders:
+#   at:    one-shot reminder at absolute or relative time
+#   every: interval-based recurring job
+#   cron:  cron-expression recurring job
+#
+# Usage:
+#   nyx-memory note "text" [--tags "t1,t2"] [--ttl DAYS]
+#   nyx-memory notes [--limit N]
+#   nyx-memory search "query"
+#   nyx-memory promote <id> [--folder FOLDER]
+#   nyx-memory cleanup
+#   nyx-memory remember "text" [--folder FOLDER] [--title TITLE]
+#   nyx-memory recall "query"
+#   nyx-memory daily ["entry"]
+#   nyx-memory context
+#   nyx-memory stats
+#   nyx-memory migrate
+#   nyx-memory remind "text" --at "TIME" [--chat JID]
+#   nyx-memory cron add --name "X" --cron|--every "EXPR" --message|--prompt "Y" [--chat JID]
+#   nyx-memory cron list
+#   nyx-memory cron remove <id>
+#   nyx-memory cron due
+#   nyx-memory cron done <id> [--status ok|error]
+
+set -euo pipefail
+
+DATA_DIR="${BRIDGE_DATA_DIR:-/data/nyx}"
+MEMORY_DIR="$DATA_DIR/memory"
+DB_PATH="$MEMORY_DIR/memory.db"
+VAULT_DIR="$MEMORY_DIR/vault"
+DEFAULT_TTL=14
+DEFAULT_CHAT="${NYX_DEFAULT_CHAT:-}"
+TZ_DEFAULT="Asia/Kolkata"
+
+VAULT_FOLDERS=(
+  "00-Inbox"
+  "10-Daily"
+  "20-Projects"
+  "30-People"
+  "40-Learnings"
+  "50-Decisions"
+  "60-Preferences"
+  "70-Archive"
+)
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+
+die() { echo "Error: $*" >&2; exit 1; }
+
+ensure_init() {
+  [ -d "$MEMORY_DIR" ] || mkdir -p "$MEMORY_DIR"
+  [ -d "$VAULT_DIR" ] || {
+    mkdir -p "$VAULT_DIR"
+    for f in "${VAULT_FOLDERS[@]}"; do
+      mkdir -p "$VAULT_DIR/$f"
+    done
+  }
+  [ -f "$DB_PATH" ] || init_db
+}
+
+HAS_FTS5=""
+
+check_fts5() {
+  if [ -n "$HAS_FTS5" ]; then return; fi
+  if sqlite3 ":memory:" "CREATE VIRTUAL TABLE _t USING fts5(x);" 2>/dev/null; then
+    HAS_FTS5=1
+  else
+    HAS_FTS5=0
+  fi
+}
+
+init_db() {
+  check_fts5
+
+  sqlite3 "$DB_PATH" <<'SQL'
+CREATE TABLE IF NOT EXISTS scratch_notes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  content TEXT NOT NULL,
+  tags TEXT DEFAULT '',
+  created_at TEXT DEFAULT (datetime('now')),
+  expires_at TEXT,
+  promoted_to TEXT,
+  metadata TEXT DEFAULT '{}'
+);
+
+CREATE TABLE IF NOT EXISTS cron_jobs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  schedule_kind TEXT NOT NULL CHECK(schedule_kind IN ('at','every','cron')),
+  schedule_value TEXT NOT NULL,
+  tz TEXT DEFAULT 'Asia/Kolkata',
+  chat_jid TEXT NOT NULL,
+  payload_kind TEXT NOT NULL CHECK(payload_kind IN ('message','prompt')),
+  payload TEXT NOT NULL,
+  enabled INTEGER DEFAULT 1,
+  delete_after_run INTEGER DEFAULT 0,
+  created_at TEXT DEFAULT (datetime('now')),
+  next_run_at TEXT NOT NULL,
+  last_run_at TEXT,
+  last_status TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_cron_next ON cron_jobs(next_run_at) WHERE enabled=1;
+SQL
+
+  if [ "$HAS_FTS5" = "1" ]; then
+    sqlite3 "$DB_PATH" <<'SQL'
+CREATE VIRTUAL TABLE IF NOT EXISTS scratch_fts USING fts5(
+  content, tags,
+  content=scratch_notes,
+  content_rowid=id
+);
+
+CREATE TRIGGER IF NOT EXISTS scratch_ai AFTER INSERT ON scratch_notes BEGIN
+  INSERT INTO scratch_fts(rowid, content, tags) VALUES (new.id, new.content, new.tags);
+END;
+CREATE TRIGGER IF NOT EXISTS scratch_ad AFTER DELETE ON scratch_notes BEGIN
+  INSERT INTO scratch_fts(scratch_fts, rowid, content, tags) VALUES('delete', old.id, old.content, old.tags);
+END;
+CREATE TRIGGER IF NOT EXISTS scratch_au AFTER UPDATE ON scratch_notes BEGIN
+  INSERT INTO scratch_fts(scratch_fts, rowid, content, tags) VALUES('delete', old.id, old.content, old.tags);
+  INSERT INTO scratch_fts(rowid, content, tags) VALUES (new.id, new.content, new.tags);
+END;
+SQL
+  fi
+}
+
+# Sanitize a string for use as a filename
+sanitize_filename() {
+  echo "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9._-]/-/g' | sed 's/--*/-/g' | sed 's/^-//' | sed 's/-$//' | head -c 60
+}
+
+# Parse relative time (20m, 2h, 3d) to ISO timestamp
+relative_to_iso() {
+  local val="$1"
+  local num="${val%[mhdMHD]}"
+  local unit="${val##*[0-9]}"
+  case "$unit" in
+    m|M) date -u -d "+${num} minutes" '+%Y-%m-%dT%H:%M:%S' 2>/dev/null || date -u -v+"${num}M" '+%Y-%m-%dT%H:%M:%S' ;;
+    h|H) date -u -d "+${num} hours" '+%Y-%m-%dT%H:%M:%S' 2>/dev/null || date -u -v+"${num}H" '+%Y-%m-%dT%H:%M:%S' ;;
+    d|D) date -u -d "+${num} days" '+%Y-%m-%dT%H:%M:%S' 2>/dev/null || date -u -v+"${num}d" '+%Y-%m-%dT%H:%M:%S' ;;
+    *)   die "Invalid relative time: $val (use Nm, Nh, or Nd)" ;;
+  esac
+}
+
+# Parse time value — relative (20m, 2h, 3d) or absolute ISO timestamp
+parse_time() {
+  local val="$1"
+  if [[ "$val" =~ ^[0-9]+[mhdMHD]$ ]]; then
+    relative_to_iso "$val"
+  elif [[ "$val" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2} ]]; then
+    echo "$val"
+  else
+    # Try GNU date parsing for natural language
+    date -u -d "$val" '+%Y-%m-%dT%H:%M:%S' 2>/dev/null || die "Cannot parse time: $val"
+  fi
+}
+
+# Compute next_run_at for interval jobs (every)
+# schedule_value is stored as seconds
+compute_next_interval() {
+  local interval_sec="$1"
+  date -u -d "+${interval_sec} seconds" '+%Y-%m-%dT%H:%M:%S' 2>/dev/null || \
+    date -u -v+"${interval_sec}S" '+%Y-%m-%dT%H:%M:%S'
+}
+
+# Parse interval string (6h, 30m, 1d) to seconds
+interval_to_seconds() {
+  local val="$1"
+  local num="${val%[mhdMHD]}"
+  local unit="${val##*[0-9]}"
+  case "$unit" in
+    m|M) echo $((num * 60)) ;;
+    h|H) echo $((num * 3600)) ;;
+    d|D) echo $((num * 86400)) ;;
+    *)   die "Invalid interval: $val" ;;
+  esac
+}
+
+# Compute next run for cron expression (simple common patterns)
+# For complex expressions, store raw and let bridge compute
+compute_next_cron() {
+  local expr="$1"
+  local now_epoch
+  now_epoch=$(date +%s)
+
+  # Parse common patterns
+  local min hour dom mon dow
+  read -r min hour dom mon dow <<< "$expr"
+
+  # Every minute: * * * * *
+  if [ "$min" = "*" ] && [ "$hour" = "*" ]; then
+    date -u -d "@$((now_epoch + 60))" '+%Y-%m-%dT%H:%M:%S' 2>/dev/null
+    return
+  fi
+
+  # Daily at HH:MM: M H * * *
+  if [ "$dom" = "*" ] && [ "$mon" = "*" ] && [ "$dow" = "*" ] && [ "$min" != "*" ] && [ "$hour" != "*" ]; then
+    local target
+    target=$(date -u -d "today ${hour}:${min}" '+%Y-%m-%dT%H:%M:%S' 2>/dev/null) || true
+    local target_epoch
+    target_epoch=$(date -u -d "$target" +%s 2>/dev/null) || target_epoch=0
+    if [ "$target_epoch" -le "$now_epoch" ]; then
+      target=$(date -u -d "tomorrow ${hour}:${min}" '+%Y-%m-%dT%H:%M:%S' 2>/dev/null)
+    fi
+    echo "$target"
+    return
+  fi
+
+  # Hourly at :MM: M * * * *
+  if [ "$hour" = "*" ] && [ "$dom" = "*" ] && [ "$mon" = "*" ] && [ "$dow" = "*" ] && [ "$min" != "*" ]; then
+    local cur_min
+    cur_min=$(date -u +%M | sed 's/^0//')
+    local target_min=$((10#$min))
+    if [ "$cur_min" -ge "$target_min" ]; then
+      date -u -d "+1 hour" '+%Y-%m-%dT%H:'"$(printf '%02d' "$target_min")"':00' 2>/dev/null
+    else
+      date -u '+%Y-%m-%dT%H:'"$(printf '%02d' "$target_min")"':00' 2>/dev/null
+    fi
+    return
+  fi
+
+  # Fallback: 1 hour from now (bridge will recompute with Node.js)
+  date -u -d "+1 hour" '+%Y-%m-%dT%H:%M:%S' 2>/dev/null
+}
+
+# ── Subcommands ────────────────────────────────────────────────────────────────
+
+cmd_note() {
+  local content="" tags="" ttl="$DEFAULT_TTL"
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --tags)  tags="${2:?--tags requires a value}"; shift 2 ;;
+      --ttl)   ttl="${2:?--ttl requires a value}"; shift 2 ;;
+      -*)      die "Unknown flag: $1" ;;
+      *)
+        if [ -z "$content" ]; then
+          content="$1"; shift
+        else
+          die "Unexpected argument: $1"
+        fi
+        ;;
+    esac
+  done
+  [ -n "$content" ] || die "Usage: nyx-memory note \"text\" [--tags \"t1,t2\"] [--ttl DAYS]"
+
+  ensure_init
+  local expires_at
+  expires_at=$(date -u -d "+${ttl} days" '+%Y-%m-%dT%H:%M:%S' 2>/dev/null || date -u -v+"${ttl}d" '+%Y-%m-%dT%H:%M:%S')
+
+  local id
+  id=$(sqlite3 "$DB_PATH" "INSERT INTO scratch_notes(content, tags, expires_at) VALUES('$(echo "$content" | sed "s/'/''/g")', '$(echo "$tags" | sed "s/'/''/g")', '$expires_at'); SELECT last_insert_rowid();")
+  echo "Saved note #${id} (expires: ${expires_at})"
+}
+
+cmd_notes() {
+  local limit=20
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --limit) limit="${2:?--limit requires a value}"; shift 2 ;;
+      *)       die "Unknown flag: $1" ;;
+    esac
+  done
+
+  ensure_init
+  sqlite3 -header -column "$DB_PATH" \
+    "SELECT id, substr(content,1,80) as content, tags, created_at, expires_at FROM scratch_notes WHERE promoted_to IS NULL ORDER BY created_at DESC LIMIT $limit;"
+}
+
+cmd_search() {
+  local query="${1:?Usage: nyx-memory search \"query\"}"
+  ensure_init
+  check_fts5
+
+  echo "=== Scratch Notes ==="
+  local escaped_query
+  escaped_query=$(echo "$query" | sed "s/'/''/g")
+  if [ "$HAS_FTS5" = "1" ]; then
+    sqlite3 -header -column "$DB_PATH" \
+      "SELECT s.id, substr(s.content,1,100) as content, s.tags, s.created_at FROM scratch_notes s JOIN scratch_fts f ON s.id = f.rowid WHERE scratch_fts MATCH '$escaped_query' ORDER BY rank LIMIT 20;" 2>/dev/null || true
+  else
+    sqlite3 -header -column "$DB_PATH" \
+      "SELECT id, substr(content,1,100) as content, tags, created_at FROM scratch_notes WHERE content LIKE '%$escaped_query%' OR tags LIKE '%$escaped_query%' ORDER BY created_at DESC LIMIT 20;"
+  fi
+
+  echo ""
+  echo "=== Wiki (grep) ==="
+  grep -ril "$query" "$VAULT_DIR" 2>/dev/null | head -20 | while read -r f; do
+    echo "--- $f"
+    grep -i "$query" "$f" | head -3
+  done || true
+}
+
+cmd_promote() {
+  local id="${1:?Usage: nyx-memory promote <id> [--folder FOLDER]}"
+  shift
+  local folder="00-Inbox"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --folder) folder="${2:?--folder requires a value}"; shift 2 ;;
+      *)        die "Unknown flag: $1" ;;
+    esac
+  done
+
+  ensure_init
+  local row
+  row=$(sqlite3 -separator '|' "$DB_PATH" "SELECT content, tags FROM scratch_notes WHERE id=$id AND promoted_to IS NULL;")
+  [ -n "$row" ] || die "Note #$id not found or already promoted"
+
+  local content tags
+  content=$(echo "$row" | cut -d'|' -f1)
+  tags=$(echo "$row" | cut -d'|' -f2-)
+
+  local ts
+  ts=$(date '+%Y%m%d-%H%M%S')
+  local title
+  title=$(sanitize_filename "$(echo "$content" | head -c 40)")
+  local filename="${ts}-${title}.md"
+  local dest="$VAULT_DIR/$folder/$filename"
+
+  mkdir -p "$VAULT_DIR/$folder"
+  {
+    echo "# $(echo "$content" | head -1 | head -c 80)"
+    echo ""
+    [ -n "$tags" ] && echo "Tags: $tags" && echo ""
+    echo "$content"
+  } > "$dest"
+
+  sqlite3 "$DB_PATH" "UPDATE scratch_notes SET promoted_to='$dest' WHERE id=$id;"
+  echo "Promoted note #$id → $dest"
+}
+
+cmd_cleanup() {
+  ensure_init
+  local now
+  now=$(date -u '+%Y-%m-%dT%H:%M:%S')
+  local count
+  count=$(sqlite3 "$DB_PATH" "SELECT count(*) FROM scratch_notes WHERE expires_at < '$now' AND promoted_to IS NULL;")
+  sqlite3 "$DB_PATH" "DELETE FROM scratch_notes WHERE expires_at < '$now' AND promoted_to IS NULL;"
+  echo "Cleaned up $count expired notes"
+}
+
+cmd_remember() {
+  local content="" folder="00-Inbox" title=""
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --folder) folder="${2:?--folder requires a value}"; shift 2 ;;
+      --title)  title="${2:?--title requires a value}"; shift 2 ;;
+      -*)       die "Unknown flag: $1" ;;
+      *)
+        if [ -z "$content" ]; then
+          content="$1"; shift
+        else
+          die "Unexpected argument: $1"
+        fi
+        ;;
+    esac
+  done
+  [ -n "$content" ] || die "Usage: nyx-memory remember \"text\" [--folder FOLDER] [--title TITLE]"
+
+  ensure_init
+
+  local ts
+  ts=$(date '+%Y%m%d-%H%M%S')
+  [ -z "$title" ] && title=$(echo "$content" | head -1 | head -c 40)
+  local safe_title
+  safe_title=$(sanitize_filename "$title")
+  local filename="${ts}-${safe_title}.md"
+  local dest="$VAULT_DIR/$folder/$filename"
+
+  mkdir -p "$VAULT_DIR/$folder"
+  {
+    echo "# $title"
+    echo ""
+    echo "Created: $(date '+%Y-%m-%d %H:%M')"
+    echo ""
+    echo "$content"
+  } > "$dest"
+
+  echo "Saved to wiki: $dest"
+}
+
+cmd_recall() {
+  local query="${1:?Usage: nyx-memory recall \"query\"}"
+  ensure_init
+
+  local results
+  results=$(grep -ril "$query" "$VAULT_DIR" 2>/dev/null | head -10)
+  if [ -z "$results" ]; then
+    echo "No wiki entries found for: $query"
+    return
+  fi
+
+  echo "$results" | while read -r f; do
+    echo "=== $f ==="
+    head -20 "$f"
+    echo ""
+  done
+}
+
+cmd_daily() {
+  ensure_init
+  local year month day
+  year=$(date '+%Y')
+  month=$(date '+%m')
+  day=$(date '+%Y-%m-%d')
+  local dir="$VAULT_DIR/10-Daily/$year/$month"
+  local filepath="$dir/$day.md"
+
+  mkdir -p "$dir"
+
+  if [ $# -eq 0 ]; then
+    # View today's diary
+    if [ -f "$filepath" ]; then
+      cat "$filepath"
+    else
+      echo "(No diary entry for $day yet)"
+    fi
+  else
+    # Append entry
+    local entry="$*"
+    if [ ! -f "$filepath" ]; then
+      printf '# Daily — %s\n\n' "$day" > "$filepath"
+    fi
+    printf '\n## %s\n\n%s\n' "$(date '+%H:%M')" "$entry" >> "$filepath"
+    echo "Added to diary: $filepath"
+  fi
+}
+
+cmd_context() {
+  ensure_init
+
+  echo "=== Recent Scratch Notes ==="
+  sqlite3 -header -column "$DB_PATH" \
+    "SELECT id, substr(content,1,120) as content, tags, created_at FROM scratch_notes WHERE promoted_to IS NULL ORDER BY created_at DESC LIMIT 10;" 2>/dev/null || true
+
+  echo ""
+  echo "=== Today's Diary ==="
+  local day
+  day=$(date '+%Y-%m-%d')
+  local filepath="$VAULT_DIR/10-Daily/$(date '+%Y')/$(date '+%m')/$day.md"
+  if [ -f "$filepath" ]; then
+    cat "$filepath"
+  else
+    echo "(No entry for today)"
+  fi
+}
+
+cmd_stats() {
+  ensure_init
+
+  local scratch_count
+  scratch_count=$(sqlite3 "$DB_PATH" "SELECT count(*) FROM scratch_notes WHERE promoted_to IS NULL;")
+  local scratch_promoted
+  scratch_promoted=$(sqlite3 "$DB_PATH" "SELECT count(*) FROM scratch_notes WHERE promoted_to IS NOT NULL;")
+  local cron_count
+  cron_count=$(sqlite3 "$DB_PATH" "SELECT count(*) FROM cron_jobs WHERE enabled=1;")
+  local wiki_count
+  wiki_count=$(find "$VAULT_DIR" -name '*.md' -type f 2>/dev/null | wc -l)
+  local disk_usage
+  disk_usage=$(du -sh "$MEMORY_DIR" 2>/dev/null | cut -f1)
+
+  echo "Memory Stats:"
+  echo "  Scratch notes (active): $scratch_count"
+  echo "  Scratch notes (promoted): $scratch_promoted"
+  echo "  Wiki files: $wiki_count"
+  echo "  Cron jobs (enabled): $cron_count"
+  echo "  Disk usage: $disk_usage"
+}
+
+cmd_migrate() {
+  local old_dir="$DATA_DIR/notes"
+  [ -d "$old_dir" ] || die "No old notes directory at $old_dir"
+
+  ensure_init
+  local migrated=0
+
+  for f in "$old_dir"/*.md; do
+    [ -f "$f" ] || continue
+    local basename
+    basename=$(basename "$f")
+    local date_str="${basename%.md}"
+
+    # Parse year/month from filename (YYYY-MM-DD.md)
+    local year month
+    year=$(echo "$date_str" | cut -d'-' -f1)
+    month=$(echo "$date_str" | cut -d'-' -f2)
+
+    local dest_dir="$VAULT_DIR/10-Daily/$year/$month"
+    mkdir -p "$dest_dir"
+
+    if [ ! -f "$dest_dir/$basename" ]; then
+      cp "$f" "$dest_dir/$basename"
+      migrated=$((migrated + 1))
+    fi
+  done
+
+  echo "Migrated $migrated daily files from $old_dir → $VAULT_DIR/10-Daily/"
+}
+
+# ── Cron subcommands ──────────────────────────────────────────────────────────
+
+cmd_remind() {
+  local text="" at_time="" chat="$DEFAULT_CHAT"
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --at)   at_time="${2:?--at requires a value}"; shift 2 ;;
+      --chat) chat="${2:?--chat requires a value}"; shift 2 ;;
+      -*)     die "Unknown flag: $1" ;;
+      *)
+        if [ -z "$text" ]; then
+          text="$1"; shift
+        else
+          die "Unexpected argument: $1"
+        fi
+        ;;
+    esac
+  done
+  [ -n "$text" ] || die "Usage: nyx-memory remind \"text\" --at \"TIME\" [--chat JID]"
+  [ -n "$at_time" ] || die "remind requires --at TIME"
+  [ -n "$chat" ] || die "remind requires --chat JID (or set NYX_DEFAULT_CHAT)"
+
+  ensure_init
+
+  local next_run
+  next_run=$(parse_time "$at_time")
+
+  local escaped_text
+  escaped_text=$(echo "$text" | sed "s/'/''/g")
+  local escaped_chat
+  escaped_chat=$(echo "$chat" | sed "s/'/''/g")
+
+  local name="reminder-$(date +%s)"
+
+  local id
+  id=$(sqlite3 "$DB_PATH" "INSERT INTO cron_jobs(name, schedule_kind, schedule_value, chat_jid, payload_kind, payload, delete_after_run, next_run_at) VALUES('$name', 'at', '$next_run', '$escaped_chat', 'message', '$escaped_text', 1, '$next_run'); SELECT last_insert_rowid();")
+  echo "Reminder #${id} set for ${next_run}: ${text}"
+}
+
+cmd_cron() {
+  local sub="${1:?Usage: nyx-memory cron <add|list|remove|due|done>}"
+  shift
+
+  case "$sub" in
+    add)  cron_add "$@" ;;
+    list) cron_list "$@" ;;
+    remove) cron_remove "$@" ;;
+    due)  cron_due "$@" ;;
+    done) cron_done "$@" ;;
+    *)    die "Unknown cron subcommand: $sub" ;;
+  esac
+}
+
+cron_add() {
+  local name="" schedule_kind="" schedule_value="" payload_kind="" payload="" chat="$DEFAULT_CHAT"
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --name)    name="${2:?--name requires a value}"; shift 2 ;;
+      --cron)    schedule_kind="cron"; schedule_value="${2:?--cron requires a value}"; shift 2 ;;
+      --every)   schedule_kind="every"; schedule_value="${2:?--every requires a value}"; shift 2 ;;
+      --at)      schedule_kind="at"; schedule_value="${2:?--at requires a value}"; shift 2 ;;
+      --message) payload_kind="message"; payload="${2:?--message requires a value}"; shift 2 ;;
+      --prompt)  payload_kind="prompt"; payload="${2:?--prompt requires a value}"; shift 2 ;;
+      --chat)    chat="${2:?--chat requires a value}"; shift 2 ;;
+      *)         die "Unknown flag: $1" ;;
+    esac
+  done
+
+  [ -n "$name" ] || die "cron add requires --name"
+  [ -n "$schedule_kind" ] || die "cron add requires --cron, --every, or --at"
+  [ -n "$payload_kind" ] || die "cron add requires --message or --prompt"
+  [ -n "$payload" ] || die "cron add requires payload text"
+  [ -n "$chat" ] || die "cron add requires --chat JID (or set NYX_DEFAULT_CHAT)"
+
+  ensure_init
+
+  local next_run delete_after=0 stored_value="$schedule_value"
+
+  case "$schedule_kind" in
+    at)
+      next_run=$(parse_time "$schedule_value")
+      stored_value="$next_run"
+      delete_after=1
+      ;;
+    every)
+      local secs
+      secs=$(interval_to_seconds "$schedule_value")
+      stored_value="$secs"
+      next_run=$(compute_next_interval "$secs")
+      ;;
+    cron)
+      next_run=$(compute_next_cron "$schedule_value")
+      stored_value="$schedule_value"
+      ;;
+  esac
+
+  local escaped_name escaped_payload escaped_chat
+  escaped_name=$(echo "$name" | sed "s/'/''/g")
+  escaped_payload=$(echo "$payload" | sed "s/'/''/g")
+  escaped_chat=$(echo "$chat" | sed "s/'/''/g")
+
+  local id
+  id=$(sqlite3 "$DB_PATH" "INSERT INTO cron_jobs(name, schedule_kind, schedule_value, chat_jid, payload_kind, payload, delete_after_run, next_run_at) VALUES('$escaped_name', '$schedule_kind', '$stored_value', '$escaped_chat', '$payload_kind', '$escaped_payload', $delete_after, '$next_run'); SELECT last_insert_rowid();")
+  echo "Created cron job #${id}: $name ($schedule_kind: $schedule_value) next run: $next_run"
+}
+
+cron_list() {
+  ensure_init
+  sqlite3 -header -column "$DB_PATH" \
+    "SELECT id, name, schedule_kind, schedule_value, payload_kind, substr(payload,1,50) as payload, enabled, next_run_at, last_run_at, last_status FROM cron_jobs ORDER BY next_run_at;"
+}
+
+cron_remove() {
+  local id="${1:?Usage: nyx-memory cron remove <id>}"
+  ensure_init
+  sqlite3 "$DB_PATH" "DELETE FROM cron_jobs WHERE id=$id;"
+  echo "Removed cron job #$id"
+}
+
+cron_due() {
+  ensure_init
+  local now
+  now=$(date -u '+%Y-%m-%dT%H:%M:%S')
+  sqlite3 -json "$DB_PATH" \
+    "SELECT id, chat_jid, payload_kind, payload FROM cron_jobs WHERE enabled=1 AND next_run_at <= '$now';" 2>/dev/null || echo "[]"
+}
+
+cron_done() {
+  local id="${1:?Usage: nyx-memory cron done <id> [--status ok|error]}"
+  shift
+  local status="ok"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --status) status="${2:?--status requires a value}"; shift 2 ;;
+      *)        die "Unknown flag: $1" ;;
+    esac
+  done
+
+  ensure_init
+
+  local now
+  now=$(date -u '+%Y-%m-%dT%H:%M:%S')
+
+  # Update last_run_at and status
+  sqlite3 "$DB_PATH" "UPDATE cron_jobs SET last_run_at='$now', last_status='$status' WHERE id=$id;"
+
+  # Get job details
+  local row
+  row=$(sqlite3 -separator '|' "$DB_PATH" "SELECT schedule_kind, schedule_value, delete_after_run FROM cron_jobs WHERE id=$id;")
+  [ -n "$row" ] || return
+
+  local kind value delete_after
+  kind=$(echo "$row" | cut -d'|' -f1)
+  value=$(echo "$row" | cut -d'|' -f2)
+  delete_after=$(echo "$row" | cut -d'|' -f3)
+
+  case "$kind" in
+    at)
+      if [ "$delete_after" = "1" ]; then
+        sqlite3 "$DB_PATH" "DELETE FROM cron_jobs WHERE id=$id;"
+      else
+        sqlite3 "$DB_PATH" "UPDATE cron_jobs SET enabled=0 WHERE id=$id;"
+      fi
+      ;;
+    every)
+      local next
+      next=$(compute_next_interval "$value")
+      sqlite3 "$DB_PATH" "UPDATE cron_jobs SET next_run_at='$next' WHERE id=$id;"
+      ;;
+    cron)
+      local next
+      next=$(compute_next_cron "$value")
+      sqlite3 "$DB_PATH" "UPDATE cron_jobs SET next_run_at='$next' WHERE id=$id;"
+      ;;
+  esac
+}
+
+# ── Main dispatch ─────────────────────────────────────────────────────────────
+
+cmd="${1:-help}"
+shift 2>/dev/null || true
+
+case "$cmd" in
+  note)     cmd_note "$@" ;;
+  notes)    cmd_notes "$@" ;;
+  search)   cmd_search "$@" ;;
+  promote)  cmd_promote "$@" ;;
+  cleanup)  cmd_cleanup "$@" ;;
+  remember) cmd_remember "$@" ;;
+  recall)   cmd_recall "$@" ;;
+  daily)    cmd_daily "$@" ;;
+  context)  cmd_context "$@" ;;
+  stats)    cmd_stats "$@" ;;
+  migrate)  cmd_migrate "$@" ;;
+  remind)   cmd_remind "$@" ;;
+  cron)     cmd_cron "$@" ;;
+  help|--help|-h)
+    echo "nyx-memory — Persistent memory and cron/reminders for Nyx"
+    echo ""
+    echo "Memory commands:"
+    echo "  note \"text\" [--tags t1,t2] [--ttl DAYS]  Add scratch note"
+    echo "  notes [--limit N]                          List recent scratch notes"
+    echo "  search \"query\"                             FTS5 search scratch + grep wiki"
+    echo "  promote <id> [--folder FOLDER]             Move scratch note to wiki"
+    echo "  cleanup                                    Delete expired scratch notes"
+    echo "  remember \"text\" [--folder F] [--title T]   Write directly to wiki"
+    echo "  recall \"query\"                             Search wiki (grep)"
+    echo "  daily [\"entry\"]                            View or append to today's diary"
+    echo "  context                                    Recent notes + today's diary"
+    echo "  stats                                      Counts and disk usage"
+    echo "  migrate                                    Import old nyx-notes files"
+    echo ""
+    echo "Cron/Reminder commands:"
+    echo "  remind \"text\" --at TIME [--chat JID]       One-shot reminder"
+    echo "  cron add --name X --cron|--every|--at EXPR --message|--prompt Y [--chat JID]"
+    echo "  cron list                                  List all jobs"
+    echo "  cron remove <id>                           Delete a job"
+    echo "  cron due                                   (internal) JSON of due jobs"
+    echo "  cron done <id> [--status ok|error]         (internal) Mark job executed"
+    echo ""
+    echo "Vault folders: ${VAULT_FOLDERS[*]}"
+    ;;
+  *)
+    die "Unknown command: $cmd (try: nyx-memory help)"
+    ;;
+esac

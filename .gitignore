@@ -73,3 +73,7 @@ mail/
 
 # Gas Town (added by gt)
 __pycache__/
+
+# Personal data (PII) — real copies live on the nyx PVC (/data/nyx/), not in git
+deploy/claude-config/nyx/contacts.json
+deploy/claude-config/nyx/wiki-seed/

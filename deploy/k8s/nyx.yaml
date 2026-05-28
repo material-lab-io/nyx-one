@@ -1,3 +1,13 @@
+# ⚠️ WARNING: this manifest is INCOMPLETE relative to the running deployment.
+# The live pod additionally mounts five configMaps via subPath
+#   (nyx-bridge-code, nyx-to-linear-code, nyx-store-code, nyx-files-code, nyx-claude-md)
+# and uses memory.limits=2Gi. Those were applied imperatively and are NOT captured here.
+# `kubectl apply -f nyx.yaml` will silently DELETE those mounts and break the running pod
+# (dropbox helpers, CLAUDE.md, bridge code, nyx-to-linear all vanish).
+#
+# To safely apply (or to bring up a fresh cluster):
+#   see deploy/k8s/README.md → "Imperative deploy state (apply after nyx.yaml)".
+# Capturing the live state back into this manifest is a tracked follow-up there.
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -104,6 +114,18 @@ spec:
                 secretKeyRef:
                   name: nyx-secrets
                   key: linear-team-key
+                  optional: true
+            - name: INGEST_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: nyx-secrets
+                  key: ingest-token
+                  optional: true
+            - name: NYX_OWNER_JID
+              valueFrom:
+                secretKeyRef:
+                  name: nyx-secrets
+                  key: nyx-owner-jid
                   optional: true
           resources:
             limits:

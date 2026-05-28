@@ -1,0 +1,140 @@
+#!/bin/bash
+# nyx-email — Gmail ops for nyx@materiallab.io via mayor-bridge.
+#
+# Usage:
+#   nyx-email send --to X --subject Y --body Z [--body-html HTML] [--attach /path] [--reply-to-message-id ID]
+#   nyx-email send --to X --subject Y --body-file /path/to/body.txt
+#   nyx-email send --to X --subject Y --body-file -            # reads body from stdin
+#   nyx-email reply --to X --subject "Re: Y" --body Z --reply-to-message-id ID [--attach /path]
+#   nyx-email list [--query "newer_than:1d"] [--max 10]
+#   nyx-email read <message_id>
+#
+# Requires: MAYOR_BRIDGE_URL, MAYOR_BRIDGE_TOKEN in env (set via k8s secret).
+
+set -euo pipefail
+
+: "${MAYOR_BRIDGE_URL:?MAYOR_BRIDGE_URL not set}"
+: "${MAYOR_BRIDGE_TOKEN:?MAYOR_BRIDGE_TOKEN not set}"
+
+SUB="${1:-}"
+shift || true
+
+usage() {
+  cat >&2 <<'EOF'
+Usage:
+  nyx-email send --to X --subject Y --body Z [--body-html HTML] [--attach /path] [--reply-to-message-id ID]
+  nyx-email reply --to X --subject Y --body Z --reply-to-message-id ID [--attach /path]
+  nyx-email list [--query "newer_than:1d"] [--max 10]
+  nyx-email read <message_id>
+EOF
+}
+
+TO=""; SUBJECT=""; BODY=""; HTML=""; ATTACH=""; REPLY_ID=""; QUERY=""; MAX=""; ID=""
+
+case "$SUB" in
+  send|reply)
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --to)                   TO="$2"; shift 2;;
+        --subject)              SUBJECT="$2"; shift 2;;
+        --body)                 BODY="$2"; shift 2;;
+        --body-file)
+          if [ "$2" = "-" ]; then BODY="$(cat)"; else BODY="$(cat "$2")"; fi
+          shift 2;;
+        --body-html|--html)     HTML="$2"; shift 2;;
+        --attach)               ATTACH="$2"; shift 2;;
+        --reply-to-message-id|--reply-to) REPLY_ID="$2"; shift 2;;
+        -h|--help) usage; exit 0;;
+        *) echo "Unknown flag: $1" >&2; exit 1;;
+      esac
+    done
+    if [ "$SUB" = "send" ]; then
+      [ -n "$TO" ]      || { echo "--to required" >&2; exit 1; }
+      [ -n "$SUBJECT" ] || { echo "--subject required" >&2; exit 1; }
+      [ -n "$BODY" ] || [ -n "$HTML" ] || { echo "--body or --body-html required" >&2; exit 1; }
+      ENDPOINT="/email/send"
+    else
+      [ -n "$REPLY_ID" ] || { echo "--reply-to-message-id required" >&2; exit 1; }
+      [ -n "$BODY" ]     || { echo "--body required" >&2; exit 1; }
+      ENDPOINT="/email/reply"
+    fi
+    ;;
+  list)
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --query) QUERY="$2"; shift 2;;
+        --max)   MAX="$2"; shift 2;;
+        -h|--help) usage; exit 0;;
+        *) echo "Unknown flag: $1" >&2; exit 1;;
+      esac
+    done
+    ENDPOINT="/email/list"
+    ;;
+  read)
+    ID="${1:-}"
+    [ -n "$ID" ] || { echo "Usage: nyx-email read <message_id>" >&2; exit 1; }
+    ENDPOINT="/email/read"
+    ;;
+  ""|-h|--help|help) usage; exit 0;;
+  *) echo "Unknown subcommand: $SUB" >&2; usage; exit 1;;
+esac
+
+export SUB ENDPOINT TO SUBJECT BODY HTML ATTACH REPLY_ID QUERY MAX ID MAYOR_BRIDGE_URL MAYOR_BRIDGE_TOKEN
+
+exec node <<'NODE'
+'use strict';
+const fs = require('fs');
+const path = require('path');
+const { URL } = require('url');
+
+const sub      = process.env.SUB || '';
+const endpoint = process.env.ENDPOINT;
+const base     = process.env.MAYOR_BRIDGE_URL;
+const token    = process.env.MAYOR_BRIDGE_TOKEN;
+
+const payload = {};
+if (sub === 'send' || sub === 'reply') {
+  if (process.env.TO)       payload.to = process.env.TO;
+  if (process.env.SUBJECT)  payload.subject = process.env.SUBJECT;
+  if (process.env.BODY)     payload.body = process.env.BODY;
+  if (process.env.HTML)     payload.body_html = process.env.HTML;
+  if (process.env.REPLY_ID) payload.reply_to_message_id = process.env.REPLY_ID;
+  if (process.env.ATTACH) {
+    const p = process.env.ATTACH;
+    if (!fs.existsSync(p)) { process.stderr.write(`attachment not found: ${p}\n`); process.exit(1); }
+    payload.attach_base64   = fs.readFileSync(p).toString('base64');
+    payload.attach_filename = path.basename(p);
+  }
+} else if (sub === 'list') {
+  if (process.env.QUERY) payload.query = process.env.QUERY;
+  if (process.env.MAX)   payload.max = parseInt(process.env.MAX, 10);
+} else if (sub === 'read') {
+  payload.message_id = process.env.ID;
+}
+
+const body = JSON.stringify(payload);
+const url = new URL(base + endpoint);
+const http = require(url.protocol === 'https:' ? 'https' : 'http');
+const req = http.request({
+  hostname: url.hostname,
+  port:     url.port || (url.protocol === 'https:' ? 443 : 80),
+  path:     url.pathname,
+  method:   'POST',
+  headers: {
+    'Content-Type':   'application/json',
+    'Authorization':  'Bearer ' + token,
+    'Content-Length': Buffer.byteLength(body),
+  },
+}, res => {
+  let data = '';
+  res.on('data', d => data += d);
+  res.on('end', () => {
+    process.stdout.write(data);
+    if (data && !data.endsWith('\n')) process.stdout.write('\n');
+    process.exit(res.statusCode >= 200 && res.statusCode < 300 ? 0 : 1);
+  });
+});
+req.on('error', e => { process.stderr.write('request failed: ' + e.message + '\n'); process.exit(1); });
+req.write(body);
+req.end();
+NODE

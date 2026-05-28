@@ -1,0 +1,18 @@
+[Unit]
+Description=Nyx Gmail Pub/Sub watcher → WhatsApp inbox alerts
+After=network-online.target mayor-bridge.service
+Wants=network-online.target
+Requires=mayor-bridge.service
+
+[Service]
+Type=simple
+User=kanaba
+EnvironmentFile=/data/mayor-bridge/secrets.env
+ExecStart=/usr/bin/python3 /home/kanaba/gt/nyx_one/crew/nyx/deploy/mayor-bridge/nyx-gmail-watcher.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
