@@ -30,6 +30,8 @@ const GOG_BIN      = process.env.GOG_BIN || '/home/kanaba/k8s/openclaw-base/gog'
 const GOG_ACCOUNT  = process.env.GOG_ACCOUNT || 'nyx@materiallab.io';
 const GOG_TIMEOUT  = parseInt(process.env.GOG_TIMEOUT_MS || '90000', 10);
 const GOG_MAX_BUF  = 50 * 1024 * 1024; // 50MB (covers ≤25MB Drive files + base64 overhead)
+const STORE_ROOT   = process.env.STORE_ROOT || '/mnt/storagebox/gt2/nyx-dropbox';
+const STORE_MAX    = parseInt(process.env.STORE_MAX_BYTES || String(2 * 1024 * 1024 * 1024), 10); // 2GB hard cap (WhatsApp's own limit)
 const ALLOWED_FROM = ['nyx', 'princess', 'sailor', 'gymbo', 'perhit'];
 const DIRECT_ROUTES = new Set(['cargo_spear/luna', 'sailor/sailor', 'gymbo/coach']);
 
@@ -287,6 +289,97 @@ async function handleDriveShare(req, res) {
   gogReply(res, await runGog(args));
 }
 
+// ── /store/* endpoints (20TB storagebox via host mount) ───────────────────────
+// The nyx pod cannot see /mnt/storagebox; it streams large files here and we
+// write them to the box on its behalf. Retrieval = promote a box file to Drive
+// for a shareable link.
+
+function storeMountReady() {
+  // Guard against the SSHFS mount being down — never write into a bare /mnt path.
+  try { return fs.existsSync('/mnt/storagebox/gt2'); } catch { return false; }
+}
+
+function safeName(name) {
+  return (name || 'file.bin').replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 200) || 'file.bin';
+}
+
+// POST /store/upload?filename=NAME[&folder=SUB] — raw file body streamed to disk.
+function handleStoreUpload(req, res) {
+  if (!storeMountReady()) return send(res, 503, { error: 'storagebox mount not available' });
+  let q;
+  try { q = new URL(req.url, 'http://x').searchParams; } catch { return send(res, 400, { error: 'bad url' }); }
+  const filename = safeName(q.get('filename'));
+  const folder   = (q.get('folder') || '').replace(/[^a-zA-Z0-9._/-]/g, '_').replace(/^\/+/, '');
+  const month    = new Date().toISOString().slice(0, 7); // yyyy-mm
+  const subdir   = path.join(STORE_ROOT, folder || month);
+  const dest     = path.join(subdir, `${randomUUID()}-${filename}`);
+
+  let size = 0, aborted = false;
+  let ws;
+  try {
+    fs.mkdirSync(subdir, { recursive: true });
+    ws = fs.createWriteStream(dest);
+  } catch (e) {
+    return send(res, 500, { error: `cannot open dest: ${e.message}` });
+  }
+
+  const cleanup = () => { try { fs.unlinkSync(dest); } catch {} };
+
+  req.on('data', d => {
+    size += d.length;
+    if (size > STORE_MAX) {
+      aborted = true;
+      req.destroy();
+      ws.destroy();
+      cleanup();
+      if (!res.writableEnded) send(res, 413, { error: `file exceeds STORE_MAX (${STORE_MAX} bytes)` });
+    }
+  });
+  req.on('error', () => { if (!aborted) { ws.destroy(); cleanup(); if (!res.writableEnded) send(res, 400, { error: 'request error' }); } });
+  ws.on('error', e => { if (!aborted) { cleanup(); if (!res.writableEnded) send(res, 500, { error: `write error: ${e.message}` }); } });
+  ws.on('finish', () => {
+    if (aborted) return;
+    console.log(`[mayor-bridge] store upload ${dest} (${size} bytes)`);
+    send(res, 200, { box_path: dest, size });
+  });
+
+  req.pipe(ws);
+}
+
+// POST /store/promote { box_path, [folder], [email] } — copy a box file to Drive,
+// return the Drive link so nyx can hand it back over WhatsApp.
+async function handleStorePromote(req, res) {
+  if (!storeMountReady()) return send(res, 503, { error: 'storagebox mount not available' });
+  let msg;
+  try { msg = await readBody(req); } catch (e) { return send(res, 400, { error: 'bad json' }); }
+  const boxPath = msg.box_path;
+  if (!boxPath) return send(res, 400, { error: 'box_path required' });
+  // Security: only promote files that live under STORE_ROOT.
+  const resolved = path.resolve(boxPath);
+  if (resolved !== STORE_ROOT && !resolved.startsWith(STORE_ROOT + path.sep)) {
+    return send(res, 403, { error: 'box_path outside store root' });
+  }
+  if (!fs.existsSync(resolved)) return send(res, 404, { error: 'box file not found' });
+
+  let parentId = null;
+  if (msg.folder) {
+    parentId = await resolveFolderId(msg.folder);
+    if (!parentId) return send(res, 404, { error: `folder not found: ${msg.folder}` });
+  }
+  const name = path.basename(resolved).replace(/^[0-9a-f-]{36}-/, ''); // strip uuid prefix
+  const args = ['drive', 'upload', resolved, '--name', name, '--json'];
+  if (parentId) args.push('--parent', parentId);
+  const result = await runGog(args);
+  if (result.exit_code === 0 && msg.email) {
+    try {
+      const j = JSON.parse(result.stdout);
+      const fid = Array.isArray(j) ? j[0]?.id : j.id;
+      if (fid) await runGog(['drive', 'share', fid, '--email', msg.email, '--role', 'reader']);
+    } catch {}
+  }
+  gogReply(res, result);
+}
+
 // ── /gog (escape hatch) ───────────────────────────────────────────────────────
 
 async function handleGog(req, res) {
@@ -314,6 +407,8 @@ const ROUTES = {
   '/drive/search':   handleDriveList,
   '/drive/download': handleDriveDownload,
   '/drive/share':    handleDriveShare,
+  '/store/upload':   handleStoreUpload,
+  '/store/promote':  handleStorePromote,
   '/gog':            handleGog,
 };
 
@@ -321,7 +416,9 @@ http.createServer((req, res) => {
   if (req.method !== 'POST') {
     return send(res, 404, 'Not found');
   }
-  const handler = ROUTES[req.url];
+  let pathname = req.url;
+  try { pathname = new URL(req.url, 'http://x').pathname; } catch {}
+  const handler = ROUTES[pathname];
   if (!handler) return send(res, 404, 'Not found');
 
   const auth = req.headers['authorization'] || '';

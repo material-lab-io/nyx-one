@@ -10,6 +10,7 @@ RUN apt-get update && apt-get install -y \
     curl \
     git \
     ca-certificates \
+    sqlite3 \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Claude Code CLI globally
@@ -43,7 +44,13 @@ RUN printf '#!/bin/sh\nexec node /app/linear-cli/linear-cli.js "$@"\n' > /usr/lo
 # Copy mayor bridge helpers (available in PATH)
 COPY deploy/mayor-bridge/nyx-to-mayor /usr/local/bin/nyx-to-mayor
 COPY deploy/mayor-bridge/nyx-send-email /usr/local/bin/nyx-send-email
-RUN chmod +x /usr/local/bin/nyx-to-mayor /usr/local/bin/nyx-send-email
+COPY deploy/mayor-bridge/nyx-email /usr/local/bin/nyx-email
+COPY deploy/mayor-bridge/nyx-drive /usr/local/bin/nyx-drive
+COPY deploy/mayor-bridge/nyx-store /usr/local/bin/nyx-store
+COPY deploy/mayor-bridge/nyx-files /usr/local/bin/nyx-files
+RUN chmod +x /usr/local/bin/nyx-to-mayor /usr/local/bin/nyx-send-email \
+              /usr/local/bin/nyx-email /usr/local/bin/nyx-drive \
+              /usr/local/bin/nyx-store /usr/local/bin/nyx-files
 
 # Temp dir for media downloads (images, documents)
 RUN mkdir -p /app/tmp
@@ -52,9 +59,12 @@ RUN mkdir -p /app/tmp
 COPY deploy/mayor-bridge/nyx-to-linear /usr/local/bin/nyx-to-linear
 RUN chmod +x /usr/local/bin/nyx-to-linear
 
-# Copy notes helper (available in PATH)
-COPY deploy/mayor-bridge/nyx-notes /usr/local/bin/nyx-notes
-RUN chmod +x /usr/local/bin/nyx-notes
+# Copy memory system (available in PATH) — replaces old nyx-notes
+COPY deploy/mayor-bridge/nyx-memory /usr/local/bin/nyx-memory
+RUN chmod +x /usr/local/bin/nyx-memory
+# Backward compat shim: old references to nyx-notes -> nyx-memory daily
+RUN printf '#!/bin/sh\nexec nyx-memory daily "$*"\n' > /usr/local/bin/nyx-notes \
+    && chmod +x /usr/local/bin/nyx-notes
 
 # Copy entrypoint
 COPY deploy/docker/entrypoint-bridge.sh /usr/local/bin/entrypoint.sh

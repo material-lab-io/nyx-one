@@ -1,0 +1,115 @@
+#!/usr/bin/env node
+'use strict';
+// nyx-store — large-file storage on the 20TB storagebox, via mayor-bridge.
+//
+// The pod can't see /mnt/storagebox, so we stream the file to the host
+// mayor-bridge which writes it to the box. Retrieval = promote a box file to
+// Google Drive for a shareable link.
+//
+// Usage:
+//   nyx-store upload <path> [--name NAME] [--folder SUBDIR]
+//   nyx-store promote <box_path> [--folder DRIVE_FOLDER] [--email EMAIL]
+//
+// Requires: MAYOR_BRIDGE_URL, MAYOR_BRIDGE_TOKEN in env.
+
+const fs   = require('fs');
+const path = require('path');
+const { URL } = require('url');
+
+const base  = process.env.MAYOR_BRIDGE_URL;
+const token = process.env.MAYOR_BRIDGE_TOKEN;
+if (!base)  { process.stderr.write('MAYOR_BRIDGE_URL not set\n'); process.exit(1); }
+if (!token) { process.stderr.write('MAYOR_BRIDGE_TOKEN not set\n'); process.exit(1); }
+
+function httpMod(u) { return require(u.protocol === 'https:' ? 'https' : 'http'); }
+
+function usage() {
+  process.stderr.write(
+    'Usage:\n' +
+    '  nyx-store upload <path> [--name NAME] [--folder SUBDIR]\n' +
+    '  nyx-store promote <box_path> [--folder DRIVE_FOLDER] [--email EMAIL]\n');
+}
+
+function parseFlags(argv) {
+  const out = { _: [] };
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i].startsWith('--')) { out[argv[i].slice(2)] = argv[i + 1]; i++; }
+    else out._.push(argv[i]);
+  }
+  return out;
+}
+
+function doUpload(args) {
+  const src = args._[0];
+  if (!src) { usage(); process.exit(1); }
+  if (!fs.existsSync(src)) { process.stderr.write(`file not found: ${src}\n`); process.exit(1); }
+  const stat = fs.statSync(src);
+  const name = args.name || path.basename(src);
+
+  const u = new URL(base + '/store/upload');
+  u.searchParams.set('filename', name);
+  if (args.folder) u.searchParams.set('folder', args.folder);
+
+  const req = httpMod(u).request({
+    hostname: u.hostname,
+    port:     u.port || (u.protocol === 'https:' ? 443 : 80),
+    path:     u.pathname + u.search,
+    method:   'POST',
+    headers: {
+      'Authorization':  'Bearer ' + token,
+      'Content-Type':   'application/octet-stream',
+      'Content-Length': stat.size,
+    },
+  }, res => {
+    let chunks = [];
+    res.on('data', d => chunks.push(d));
+    res.on('end', () => {
+      const raw = Buffer.concat(chunks).toString('utf8');
+      process.stdout.write(raw + (raw.endsWith('\n') ? '' : '\n'));
+      process.exit(res.statusCode >= 200 && res.statusCode < 300 ? 0 : 1);
+    });
+  });
+  req.on('error', e => { process.stderr.write('request failed: ' + e.message + '\n'); process.exit(1); });
+  fs.createReadStream(src).pipe(req);
+}
+
+function doPromote(args) {
+  const boxPath = args._[0];
+  if (!boxPath) { usage(); process.exit(1); }
+  const payload = { box_path: boxPath };
+  if (args.folder) payload.folder = args.folder;
+  if (args.email)  payload.email  = args.email;
+  const body = JSON.stringify(payload);
+
+  const u = new URL(base + '/store/promote');
+  const req = httpMod(u).request({
+    hostname: u.hostname,
+    port:     u.port || (u.protocol === 'https:' ? 443 : 80),
+    path:     u.pathname,
+    method:   'POST',
+    headers: {
+      'Authorization':  'Bearer ' + token,
+      'Content-Type':   'application/json',
+      'Content-Length': Buffer.byteLength(body),
+    },
+  }, res => {
+    let chunks = [];
+    res.on('data', d => chunks.push(d));
+    res.on('end', () => {
+      const raw = Buffer.concat(chunks).toString('utf8');
+      process.stdout.write(raw + (raw.endsWith('\n') ? '' : '\n'));
+      process.exit(res.statusCode >= 200 && res.statusCode < 300 ? 0 : 1);
+    });
+  });
+  req.on('error', e => { process.stderr.write('request failed: ' + e.message + '\n'); process.exit(1); });
+  req.write(body);
+  req.end();
+}
+
+const sub = process.argv[2] || '';
+const rest = parseFlags(process.argv.slice(3));
+switch (sub) {
+  case 'upload':  doUpload(rest); break;
+  case 'promote': doPromote(rest); break;
+  default: usage(); process.exit(sub === '-h' || sub === '--help' ? 0 : 1);
+}

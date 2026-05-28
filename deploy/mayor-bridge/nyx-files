@@ -1,0 +1,150 @@
+#!/bin/bash
+# nyx-files — Persistent index of files Kanaba/contacts sent nyx over WhatsApp.
+#
+# The bytes live in Google Drive (small) or the storagebox (large); this is just
+# the searchable index so nyx can answer "what did Damini send last week?" and
+# hand back a link. DB lives on the PVC (/data/nyx) so it survives pod restarts.
+#
+# Usage:
+#   nyx-files add --orig-name NAME --backend drive|box --location ID|PATH \
+#       [--sender NAME] [--sender-jid JID] [--chat JID] [--mime MIME] \
+#       [--size BYTES] [--link URL] [--caption TEXT] [--tags "t1,t2"]
+#   nyx-files list [--sender NAME] [--since 7d|ISO] [--tag TAG] [--max N]
+#   nyx-files search "query"
+#   nyx-files get <id>
+
+set -euo pipefail
+
+DATA_DIR="${BRIDGE_DATA_DIR:-/data/nyx}"
+DB_PATH="$DATA_DIR/files.db"
+
+die() { echo "Error: $*" >&2; exit 1; }
+esc() { echo "$1" | sed "s/'/''/g"; }
+
+ensure_init() {
+  [ -d "$DATA_DIR" ] || mkdir -p "$DATA_DIR"
+  sqlite3 "$DB_PATH" <<'SQL'
+CREATE TABLE IF NOT EXISTS files (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts          TEXT DEFAULT (datetime('now')),
+  sender_name TEXT DEFAULT '',
+  sender_jid  TEXT DEFAULT '',
+  chat_jid    TEXT DEFAULT '',
+  orig_name   TEXT NOT NULL,
+  mime        TEXT DEFAULT '',
+  size_bytes  INTEGER DEFAULT 0,
+  backend     TEXT DEFAULT '',
+  location    TEXT DEFAULT '',
+  link        TEXT DEFAULT '',
+  caption     TEXT DEFAULT '',
+  tags        TEXT DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_files_ts     ON files(ts);
+CREATE INDEX IF NOT EXISTS idx_files_sender ON files(sender_jid);
+CREATE INDEX IF NOT EXISTS idx_files_name   ON files(orig_name);
+SQL
+}
+
+# Convert "7d"/"12h"/"30m" to a sqlite datetime modifier; pass ISO through.
+since_to_clause() {
+  local val="$1"
+  if [[ "$val" =~ ^([0-9]+)([mhdMHD])$ ]]; then
+    local num="${BASH_REMATCH[1]}" unit="${BASH_REMATCH[2]}"
+    case "$unit" in
+      m|M) echo "ts >= datetime('now', '-${num} minutes')" ;;
+      h|H) echo "ts >= datetime('now', '-${num} hours')" ;;
+      d|D) echo "ts >= datetime('now', '-${num} days')" ;;
+    esac
+  else
+    echo "ts >= '$(esc "$val")'"
+  fi
+}
+
+cmd_add() {
+  local sender="" sender_jid="" chat="" orig="" mime="" size="0"
+  local backend="" location="" link="" caption="" tags=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --sender)     sender="${2:?}"; shift 2 ;;
+      --sender-jid) sender_jid="${2:?}"; shift 2 ;;
+      --chat)       chat="${2:?}"; shift 2 ;;
+      --orig-name)  orig="${2:?}"; shift 2 ;;
+      --mime)       mime="${2:?}"; shift 2 ;;
+      --size)       size="${2:?}"; shift 2 ;;
+      --backend)    backend="${2:?}"; shift 2 ;;
+      --location)   location="${2:?}"; shift 2 ;;
+      --link)       link="${2:?}"; shift 2 ;;
+      --caption)    caption="${2:?}"; shift 2 ;;
+      --tags)       tags="${2:?}"; shift 2 ;;
+      *)            die "Unknown flag: $1" ;;
+    esac
+  done
+  [ -n "$orig" ]     || die "add requires --orig-name"
+  [ -n "$backend" ]  || die "add requires --backend"
+  [ -n "$location" ] || die "add requires --location"
+  [[ "$size" =~ ^[0-9]+$ ]] || size=0
+  ensure_init
+  local id
+  id=$(sqlite3 "$DB_PATH" "INSERT INTO files(sender_name,sender_jid,chat_jid,orig_name,mime,size_bytes,backend,location,link,caption,tags) VALUES('$(esc "$sender")','$(esc "$sender_jid")','$(esc "$chat")','$(esc "$orig")','$(esc "$mime")',$size,'$(esc "$backend")','$(esc "$location")','$(esc "$link")','$(esc "$caption")','$(esc "$tags")'); SELECT last_insert_rowid();")
+  echo "Indexed file #${id}: ${orig} (${backend})"
+}
+
+cmd_list() {
+  local sender="" since="" tag="" max=20
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --sender) sender="${2:?}"; shift 2 ;;
+      --since)  since="${2:?}"; shift 2 ;;
+      --tag)    tag="${2:?}"; shift 2 ;;
+      --max)    max="${2:?}"; shift 2 ;;
+      *)        die "Unknown flag: $1" ;;
+    esac
+  done
+  [[ "$max" =~ ^[0-9]+$ ]] || max=20
+  ensure_init
+  local where="1=1"
+  if [ -n "$sender" ]; then
+    local s; s=$(esc "$sender")
+    where="$where AND (sender_name LIKE '%$s%' OR sender_jid LIKE '%$s%')"
+  fi
+  [ -n "$since" ] && where="$where AND $(since_to_clause "$since")"
+  [ -n "$tag" ] && where="$where AND tags LIKE '%$(esc "$tag")%'"
+  sqlite3 -header -column "$DB_PATH" \
+    "SELECT id, ts, sender_name, substr(orig_name,1,40) AS name, size_bytes, backend FROM files WHERE $where ORDER BY ts DESC LIMIT $max;"
+}
+
+cmd_search() {
+  local q="${1:?Usage: nyx-files search \"query\"}"
+  ensure_init
+  local e; e=$(esc "$q")
+  sqlite3 -header -column "$DB_PATH" \
+    "SELECT id, ts, sender_name, substr(orig_name,1,40) AS name, backend FROM files WHERE orig_name LIKE '%$e%' OR caption LIKE '%$e%' OR tags LIKE '%$e%' OR sender_name LIKE '%$e%' ORDER BY ts DESC LIMIT 20;"
+}
+
+cmd_get() {
+  local id="${1:?Usage: nyx-files get <id>}"
+  [[ "$id" =~ ^[0-9]+$ ]] || die "id must be numeric"
+  ensure_init
+  sqlite3 -json "$DB_PATH" "SELECT * FROM files WHERE id=$id;"
+}
+
+cmd="${1:-help}"
+shift 2>/dev/null || true
+case "$cmd" in
+  add)    cmd_add "$@" ;;
+  list)   cmd_list "$@" ;;
+  search) cmd_search "$@" ;;
+  get)    cmd_get "$@" ;;
+  help|--help|-h)
+    cat <<'EOF'
+nyx-files — index of files received over WhatsApp (Drive + storagebox)
+
+  add --orig-name NAME --backend drive|box --location ID|PATH [opts]
+      opts: --sender --sender-jid --chat --mime --size --link --caption --tags
+  list [--sender NAME] [--since 7d|ISO] [--tag TAG] [--max N]
+  search "query"          match name/caption/tags/sender
+  get <id>                full JSON row
+EOF
+    ;;
+  *) die "Unknown command: $cmd (try: nyx-files help)" ;;
+esac

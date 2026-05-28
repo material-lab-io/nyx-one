@@ -52,6 +52,16 @@ try { GROUPS_CONFIG = JSON.parse(process.env.BRIDGE_WA_GROUPS || process.env.NYX
 
 const TMP_DIR = '/app/tmp';
 
+// ── Dropbox: auto-save received media to durable storage ──────────────────────
+// Files ≤ DRIVE_MAX go to Google Drive (shareable link); larger files (up to
+// BOX_MAX) are archived to the 20TB storagebox via nyx-store. Every saved file
+// is recorded in the nyx-files index so nyx can find it later.
+const DRIVE_MAX_BYTES = parseInt(process.env.NYX_DRIVE_MAX_BYTES || String(25 * 1024 * 1024), 10);
+// Large files stream to disk (constant memory), so the ceiling is ephemeral disk,
+// not pod RAM — set to WhatsApp's own ~2GB media limit.
+const BOX_MAX_BYTES   = parseInt(process.env.NYX_BOX_MAX_BYTES   || String(2 * 1024 * 1024 * 1024), 10);
+const DROPBOX_FOLDER  = process.env.NYX_DROPBOX_FOLDER || 'Nyx Dropbox';
+
 const CREDS_DIR   = path.join(DATA_DIR, 'creds');
 const HISTORY_DIR = path.join(DATA_DIR, 'conversations');
 
@@ -547,31 +557,117 @@ function invokeClaude(prompt) {
   });
 }
 
+// ── Streaming media download (constant memory, for large files) ───────────────
+// Streams WhatsApp media straight to disk instead of buffering it in RAM, so the
+// size ceiling is ephemeral disk, not the pod's memory limit. Returns bytes written.
+// Aborts (and deletes the partial file) if it would exceed maxBytes.
+async function streamDownloadToFile(msg, sock, tmpPath, maxBytes) {
+  fs.mkdirSync(path.dirname(tmpPath), { recursive: true });
+  const stream = await downloadMediaMessage(
+    msg, 'stream', {}, { logger, reuploadRequest: sock.updateMediaMessage });
+  let bytes = 0;
+  try {
+    await new Promise((resolve, reject) => {
+      const ws = fs.createWriteStream(tmpPath);
+      stream.on('data', chunk => {
+        bytes += chunk.length;
+        if (maxBytes && bytes > maxBytes) {
+          stream.destroy();
+          ws.destroy();
+          reject(new Error(`exceeds cap (${maxBytes} bytes)`));
+        }
+      });
+      stream.on('error', reject);
+      ws.on('error', reject);
+      ws.on('finish', resolve);
+      stream.pipe(ws);
+    });
+  } catch (err) {
+    try { fs.unlinkSync(tmpPath); } catch {}
+    throw err;
+  }
+  return bytes;
+}
+
+// ── Dropbox: save a downloaded media file to durable storage + index it ───────
+// Best-effort: returns a short note to append to the prompt so nyx can confirm
+// to the user with a link. Never throws.
+async function archiveMedia(media, who) {
+  const { tmpPath, origName, mime, sizeBytes, caption } = media;
+  const sizeMB = (sizeBytes / 1024 / 1024).toFixed(1);
+  try {
+    let backend, location = '', link = '';
+    if (sizeBytes <= DRIVE_MAX_BYTES) {
+      backend = 'drive';
+      const { stdout } = await execFileAsync(
+        'nyx-drive', ['upload', tmpPath, '--name', origName, '--folder', DROPBOX_FOLDER],
+        { timeout: 120000, maxBuffer: 8 * 1024 * 1024 });
+      try {
+        const j = JSON.parse(stdout);
+        const o = Array.isArray(j) ? j[0] : (j.files ? j.files[0] : j);
+        location = (o && o.id) || '';
+        link = (o && (o.webViewLink || o.link || o.url)) || '';
+      } catch {}
+    } else {
+      backend = 'box';
+      const { stdout } = await execFileAsync(
+        'nyx-store', ['upload', tmpPath, '--name', origName],
+        { timeout: 900000, maxBuffer: 1 * 1024 * 1024 });
+      try { location = (JSON.parse(stdout).box_path) || ''; } catch {}
+    }
+
+    const addArgs = ['add',
+      '--orig-name', origName,
+      '--backend', backend,
+      '--location', location || 'unknown',
+      '--mime', mime || '',
+      '--size', String(sizeBytes || 0),
+      '--sender', who.senderName || '',
+      '--sender-jid', who.senderJid || '',
+      '--chat', who.chatJid || ''];
+    if (link) addArgs.push('--link', link);
+    if (caption) addArgs.push('--caption', caption);
+    try { await execFileAsync('nyx-files', addArgs, { timeout: 15000 }); }
+    catch (e) { logger.warn({ err: e.message }, 'nyx-files index failed'); }
+
+    if (backend === 'drive') {
+      return link
+        ? `\n[Auto-saved to Drive: ${link} — confirm to the user it's saved and share this link.]`
+        : `\n[Auto-saved to Drive folder "${DROPBOX_FOLDER}" — confirm to the user it's saved.]`;
+    }
+    return `\n[Auto-archived to storagebox (${sizeMB}MB — too large for a direct WhatsApp link). Indexed for retrieval; tell the user it's saved. A shareable link can be generated later with: nyx-store promote "${location}".]`;
+  } catch (err) {
+    logger.error({ err: err.message, origName }, 'archiveMedia failed');
+    return `\n[Note: could not auto-save "${origName}" (${sizeMB}MB) — tell the user the file wasn't saved.]`;
+  }
+}
+
 // ── Media content extraction ──────────────────────────────────────────────────
-// Returns { content: string, tempFiles: string[] }
-// tempFiles are cleaned up after Claude responds.
+// Returns { content: string, tempFiles: string[], media: object|null }
+// `media` (when set) is a downloaded file to auto-save: { tmpPath, origName,
+// mime, sizeBytes, caption }. tempFiles are cleaned up after Claude responds.
 // sock is passed for audio to enable media reupload on stale messages.
 async function extractContent(msg, sock) {
   const m = msg.message;
-  if (!m) return { content: '', tempFiles: [] };
+  if (!m) return { content: '', tempFiles: [], media: null };
 
   // Plain text
   const text = m.conversation || m.extendedTextMessage?.text || '';
-  if (text) return { content: text, tempFiles: [] };
+  if (text) return { content: text, tempFiles: [], media: null };
 
   // Audio / Voice note — delegate to transcribeMessage (handles MIME + reupload)
   if (m.audioMessage || m.pttMessage) {
     if (!GROQ_API_KEY) {
-      return { content: '[voice note - transcription unavailable]', tempFiles: [] };
+      return { content: '[voice note - transcription unavailable]', tempFiles: [], media: null };
     }
     const transcript = await transcribeMessage(sock, msg);
     if (!transcript) {
-      return { content: '[voice note - could not transcribe]', tempFiles: [] };
+      return { content: '[voice note - could not transcribe]', tempFiles: [], media: null };
     }
-    return { content: `[Voice note transcript]: ${transcript}`, tempFiles: [] };
+    return { content: `[Voice note transcript]: ${transcript}`, tempFiles: [], media: null };
   }
 
-  // Image
+  // Image — always downloaded (and auto-saved); agent can Read it during its turn
   if (m.imageMessage) {
     const caption = m.imageMessage.caption || '';
     try {
@@ -583,44 +679,60 @@ async function extractContent(msg, sock) {
       return {
         content: `User sent an image, saved at ${tmpPath}.${captionPart}`,
         tempFiles: [tmpPath],
+        media: { tmpPath, origName: `image-${Date.now()}.jpg`, mime: m.imageMessage.mimetype || 'image/jpeg', sizeBytes: buf.length, caption },
       };
     } catch (err) {
       logger.error({ err }, 'Image download failed');
-      return { content: caption || '[image - could not download]', tempFiles: [] };
+      return { content: caption || '[image - could not download]', tempFiles: [], media: null };
     }
   }
 
-  // Video (no download — too large, no ffmpeg)
+  // Video — stream to disk + auto-save up to BOX_MAX (declared size gates the cap)
   if (m.videoMessage) {
     const caption = m.videoMessage.caption || '';
-    return { content: `[Video message]${caption ? ` Caption: ${caption}` : ''}`, tempFiles: [] };
+    const fileLength = m.videoMessage.fileLength ? Number(m.videoMessage.fileLength) : 0;
+    if (fileLength === 0 || fileLength <= BOX_MAX_BYTES) {
+      const ext = ((m.videoMessage.mimetype || 'video/mp4').split('/')[1] || 'mp4').split(';')[0];
+      const tmpPath = path.join(TMP_DIR, `${randomUUID()}.${ext}`);
+      try {
+        const bytes = await streamDownloadToFile(msg, sock, tmpPath, BOX_MAX_BYTES);
+        return {
+          content: `User sent a video${caption ? ` Caption: ${caption}` : ''}`,
+          tempFiles: [tmpPath],
+          media: { tmpPath, origName: `video-${Date.now()}.${ext}`, mime: m.videoMessage.mimetype || 'video/mp4', sizeBytes: bytes, caption },
+        };
+      } catch (err) {
+        logger.error({ err: err.message }, 'Video download failed');
+        return { content: `User sent a video${caption ? ` Caption: ${caption}` : ''} — could not save`, tempFiles: [], media: null };
+      }
+    }
+    const sizePart = ` — ${(fileLength / 1024 / 1024).toFixed(1)}MB, too large to auto-save (>${(BOX_MAX_BYTES / 1024 / 1024 / 1024).toFixed(0)}GB)`;
+    return { content: `User sent a video${caption ? ` Caption: ${caption}` : ''}${sizePart}`, tempFiles: [], media: null };
   }
 
-  // Document
+  // Document — stream to disk + auto-save up to BOX_MAX
   if (m.documentMessage) {
-    const { fileName = 'document', mimetype = 'application/octet-stream', fileLength } = m.documentMessage;
-    const sizeBytes = fileLength ? Number(fileLength) : 0;
-    const MAX_DOC = 5 * 1024 * 1024;
-    if (sizeBytes > 0 && sizeBytes <= MAX_DOC) {
+    const { fileName = 'document', mimetype = 'application/octet-stream', fileLength, caption = '' } = m.documentMessage;
+    const declared = fileLength ? Number(fileLength) : 0;
+    if (declared === 0 || declared <= BOX_MAX_BYTES) {
+      const tmpPath = path.join(TMP_DIR, `${randomUUID()}-${fileName}`);
       try {
-        const buf = await downloadMediaMessage(msg, 'buffer', {});
-        const tmpPath = path.join(TMP_DIR, `${randomUUID()}-${fileName}`);
-        fs.mkdirSync(TMP_DIR, { recursive: true });
-        fs.writeFileSync(tmpPath, buf);
+        const bytes = await streamDownloadToFile(msg, sock, tmpPath, BOX_MAX_BYTES);
         return {
           content: `User sent a document: ${fileName} (${mimetype}), saved at ${tmpPath}`,
           tempFiles: [tmpPath],
+          media: { tmpPath, origName: fileName, mime: mimetype, sizeBytes: bytes, caption },
         };
       } catch (err) {
-        logger.error({ err }, 'Document download failed');
-        return { content: `User sent a document: ${fileName} (${mimetype}) — could not download`, tempFiles: [] };
+        logger.error({ err: err.message }, 'Document download failed');
+        return { content: `User sent a document: ${fileName} (${mimetype}) — could not save`, tempFiles: [], media: null };
       }
     }
-    const sizePart = sizeBytes ? ` — ${(sizeBytes / 1024 / 1024).toFixed(1)}MB, too large to download` : '';
-    return { content: `User sent a document: ${fileName} (${mimetype})${sizePart}`, tempFiles: [] };
+    const sizePart = ` — ${(declared / 1024 / 1024).toFixed(1)}MB, too large to auto-save (>${(BOX_MAX_BYTES / 1024 / 1024 / 1024).toFixed(0)}GB)`;
+    return { content: `User sent a document: ${fileName} (${mimetype})${sizePart}`, tempFiles: [], media: null };
   }
 
-  return { content: '', tempFiles: [] };
+  return { content: '', tempFiles: [], media: null };
 }
 
 // ── Process one message (serialized per chatId) ───────────────────────────────
@@ -630,7 +742,7 @@ async function processMessage(sock, msg) {
   const botJid  = sock.user?.id || '';
 
   // Extract content — async (may transcribe audio or download media)
-  const { content, tempFiles } = await extractContent(msg, sock);
+  let { content, tempFiles, media } = await extractContent(msg, sock);
 
   if (!content.trim()) return;
 
@@ -671,6 +783,14 @@ async function processMessage(sock, msg) {
   logger.info({ jid, sender: senderName, isGroup }, 'Received message: %s', content.slice(0, 80));
 
   await sock.sendPresenceUpdate('composing', jid);
+
+  // Auto-save any received file to durable storage + index, then tell the agent
+  // where it landed so it can confirm to the user with a link.
+  if (media) {
+    const note = await archiveMedia(media, { senderName, senderJid, chatJid: jid });
+    content += note;
+  }
+
   appendHistory(jid, 'user', `${senderName}: ${content}`);
 
   const prompt = buildPrompt(jid, content, senderName);
