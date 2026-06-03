@@ -230,6 +230,14 @@ async function handleDriveUpload(req, res) {
     if (parentId) args.push('--parent', parentId);
     return runGog(args);
   });
+  // Auto-share with anyone-with-link after upload (default for org accessibility)
+  if (result.exit_code === 0) {
+    try {
+      const parsed = JSON.parse(result.stdout);
+      const fileId = parsed?.file?.id;
+      if (fileId) await runGog(['drive', 'share', fileId, '--anyone', '--role', 'reader']);
+    } catch {}
+  }
   gogReply(res, result);
 }
 
@@ -281,12 +289,23 @@ async function handleDriveDownload(req, res) {
 async function handleDriveShare(req, res) {
   let msg;
   try { msg = await readBody(req); } catch (e) { return send(res, 400, { error: 'bad json' }); }
-  const { file_id, email, role = 'reader' } = msg;
-  if (!file_id || !email) return send(res, 400, { error: 'file_id and email required' });
+  const { file_id, email, role = 'reader', anyone = false } = msg;
+  if (!file_id) return send(res, 400, { error: 'file_id required' });
   // gog accepts reader|writer; accept plan's "editor"/"viewer" too
   const mapped = role === 'editor' || role === 'writer' ? 'writer' : 'reader';
-  const args = ['drive', 'share', file_id, '--email', email, '--role', mapped];
-  gogReply(res, await runGog(args));
+  // Default: share with anyone-with-link (most accessible for org use).
+  // Pass anyone=false + email=... to restrict to a specific user instead.
+  if (email && !anyone) {
+    const args = ['drive', 'share', file_id, '--email', email, '--role', mapped];
+    gogReply(res, await runGog(args));
+  } else {
+    // anyone-with-link (default) — also run email share if provided
+    const anyoneResult = await runGog(['drive', 'share', file_id, '--anyone', '--role', mapped]);
+    if (email && anyoneResult.exit_code === 0) {
+      await runGog(['drive', 'share', file_id, '--email', email, '--role', mapped]);
+    }
+    gogReply(res, anyoneResult);
+  }
 }
 
 // ── /store/* endpoints (20TB storagebox via host mount) ───────────────────────
