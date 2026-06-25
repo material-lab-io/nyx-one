@@ -1,6 +1,11 @@
-# TODO: nyx-repair.sh can't break the 401-logout CrashLoop (dead creds persist in secret)
+# Runbook: nyx-repair.sh and the 401-logout CrashLoop (dead creds persist in secret)
 
 **Filed:** 2026-06-25 by crew/nyx (bd create blocked by Dolt schema-migration error; recorded here instead)
+
+**Status: RESOLVED 2026-06-25 (bead no-4hl).** `nyx-repair.sh` now empties the
+secret in `clear-creds`/`recover` and persists fresh creds back to the secret
+after a successful `pair`, so the loop is self-healable via `nyx-repair.sh recover <phone>`.
+The RCA below is retained for reference.
 
 ## Root cause (caused a 2-day outage, 365 restarts 2026-06-23..25)
 On WhatsApp 401 `loggedOut`, `baileys-bridge.js` wipes PVC creds (`/data/nyx/creds`) and `process.exit(1)`.

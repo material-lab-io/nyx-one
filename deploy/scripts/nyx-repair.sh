@@ -8,6 +8,8 @@ DATA_MOUNT="/data/nyx"
 CREDS_PATH="${DATA_MOUNT}/creds"
 HEALTH_PORT="8080"
 PVC_NAME="nyx-data-pvc"
+SECRET_NAME="nyx-secrets"
+SECRET_KEY="whatsapp-creds-json"
 
 info()  { echo "[nyx-repair] $*" >&2; }
 die()   { echo "[nyx-repair] ERROR: $*" >&2; exit 1; }
@@ -18,8 +20,8 @@ nyx-repair.sh — Nyx WhatsApp bridge repair runbook
 
 USAGE:
   nyx-repair.sh status                Show pod state, logs, creds, health
-  nyx-repair.sh clear-creds           Wipe creds on PVC and restart
-  nyx-repair.sh pair <phone>          Set pairing phone and capture code
+  nyx-repair.sh clear-creds           Wipe creds on PVC + empty secret, restart
+  nyx-repair.sh pair <phone>          Set pairing phone, capture code, persist creds to secret
   nyx-repair.sh recover <phone>       clear-creds → pair (end-to-end re-link)
   nyx-repair.sh -h | --help           Show this help
 
@@ -42,6 +44,34 @@ get_pod_name() {
   name=$(kubectl get pods -n "$NAMESPACE" -l "$APP_LABEL" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
   [ -n "$name" ] || die "no nyx pod found in namespace $NAMESPACE"
   echo "$name"
+}
+
+# Empty the WhatsApp creds in the secret. Without this, the entrypoint
+# re-bootstraps stale/logged-out creds from the secret on every restart, which
+# defeats a PVC-only clear and produces an unbreakable 401-logout CrashLoop.
+clear_secret_creds() {
+  info "Emptying secret ${SECRET_NAME}/${SECRET_KEY} (stops re-bootstrap of dead creds)..."
+  kubectl patch secret "$SECRET_NAME" -n "$NAMESPACE" --type merge \
+    -p "{\"data\":{\"${SECRET_KEY}\":\"\"}}" >/dev/null
+  info "Secret creds emptied."
+}
+
+# Persist the live, freshly-paired creds.json from the pod's PVC back into the
+# secret, so a future pod reschedule (PVC loss) bootstraps GOOD creds instead of
+# forcing a manual re-pair.
+persist_creds_to_secret() {
+  local pod creds_b64
+  pod=$(get_pod_name)
+  creds_b64=$(kubectl exec -n "$NAMESPACE" "$pod" -- cat "${CREDS_PATH}/creds.json" 2>/dev/null | base64 -w0) || true
+  if [ -z "$creds_b64" ]; then
+    info "WARN: could not read ${CREDS_PATH}/creds.json from pod — secret NOT updated."
+    info "      Fresh creds live on the PVC; re-pair will be needed if the PVC is lost."
+    return 1
+  fi
+  info "Persisting fresh creds.json back into secret ${SECRET_NAME}/${SECRET_KEY}..."
+  kubectl patch secret "$SECRET_NAME" -n "$NAMESPACE" --type merge \
+    -p "{\"data\":{\"${SECRET_KEY}\":\"${creds_b64}\"}}" >/dev/null
+  info "Secret updated with fresh creds."
 }
 
 cmd_status() {
@@ -127,6 +157,10 @@ OJSON
     --image=busybox:latest --overrides="$overrides" \
     -- sh -c "rm -rf ${CREDS_PATH} && echo CLEARED" 2>&1
 
+  # Also empty the secret — otherwise the entrypoint re-bootstraps the dead
+  # creds onto the freshly-wiped PVC and the 401-logout loop continues.
+  clear_secret_creds
+
   info "Restarting deployment..."
   kubectl rollout restart deployment/"$DEPLOY_NAME" -n "$NAMESPACE"
   kubectl rollout status deployment/"$DEPLOY_NAME" -n "$NAMESPACE" --timeout=120s
@@ -203,7 +237,9 @@ cmd_pair() {
   done
 
   if $connected; then
-    info "WhatsApp connected! Cleaning up env var..."
+    info "WhatsApp connected! Persisting fresh creds to secret..."
+    persist_creds_to_secret || true
+    info "Cleaning up env var..."
     kubectl set env deployment/"$DEPLOY_NAME" -n "$NAMESPACE" "BRIDGE_PAIRING_PHONE-"
     info "Done. Nyx is paired and running."
   else
